@@ -1,0 +1,13 @@
+{
+  "name": "imgviewer-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "build:frontend": "esbuild static/src/app.ts --bundle --platform=browser --target=es2020 --outfile=static/app.js && cp static/src/styles.css static/app.css",
+    "typecheck:frontend": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "esbuild": "^0.23.1",
+    "typescript": "^5.6.3"
+  }
+}
