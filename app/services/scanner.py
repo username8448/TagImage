@@ -13,6 +13,7 @@ from ..config import (
     THUMBS_DIR_NAME,
 )
 from ..repo.content import (
+    cleanup_hidden_image_tag_data,
     fetch_existing_images_map,
     mark_images_hidden_for_root,
     replace_image_tags,
@@ -101,7 +102,6 @@ def run_rescan_job(*, root: Path, job_id: Optional[str] = None) -> dict[str, Any
                 thumb_rel = f"{INDEX_DIR_NAME}/{THUMBS_DIR_NAME}/{existing_id}.jpg"
                 thumb_path = root / thumb_rel
                 width, height = image_dimensions(img_path)
-                auto_tags = [part for part in Path(rel).parts[:-1] if part]
 
                 db_img_id = upsert_image_row(
                     cur,
@@ -115,7 +115,7 @@ def run_rescan_job(*, root: Path, job_id: Optional[str] = None) -> dict[str, Any
                     existing_id=existing_id,
                 )
 
-                replace_image_tags(cur, db_img_id, auto_tags, "auto")
+                replace_image_tags(cur, db_img_id, [], "auto")
 
                 needs_thumb = (
                     not thumb_path.exists()
@@ -143,6 +143,8 @@ def run_rescan_job(*, root: Path, job_id: Optional[str] = None) -> dict[str, Any
                 done += 1
                 if job_id and (done % 20 == 0 or done == total):
                     touch_job_progress(job_id, done=done, total=total)
+
+            cleanup_hidden_image_tag_data(cur)
 
     if job_id:
         mark_job_succeeded(job_id, total=total)

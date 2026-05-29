@@ -145,11 +145,27 @@ def ensure_db_ready() -> None:
                             name text NOT NULL,
                             normalized text NOT NULL UNIQUE,
                             color text,
+                            user_defined boolean NOT NULL DEFAULT false,
                             created_at timestamptz NOT NULL DEFAULT now()
                         )
                         """
                     )
                     cur.execute("ALTER TABLE tags ADD COLUMN IF NOT EXISTS color text")
+                    cur.execute(
+                        """
+                        ALTER TABLE tags
+                        ADD COLUMN IF NOT EXISTS user_defined boolean NOT NULL DEFAULT false
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS suppressed_auto_tags (
+                            normalized text PRIMARY KEY,
+                            name text NOT NULL,
+                            created_at timestamptz NOT NULL DEFAULT now()
+                        )
+                        """
+                    )
                     cur.execute(
                         """
                         CREATE TABLE IF NOT EXISTS image_tags (
@@ -163,9 +179,35 @@ def ensure_db_ready() -> None:
                     )
                     cur.execute(
                         """
+                        UPDATE tags
+                        SET user_defined = true
+                        WHERE user_defined = false
+                          AND EXISTS (
+                              SELECT 1
+                              FROM image_tags it
+                              WHERE it.tag_id = tags.id
+                                AND it.kind = 'user'
+                          )
+                        """
+                    )
+                    cur.execute("DELETE FROM image_tags WHERE kind = 'auto'")
+                    cur.execute(
+                        """
+                        DELETE FROM tags t
+                        WHERE t.user_defined = false
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM image_tags it
+                              WHERE it.tag_id = t.id
+                          )
+                        """
+                    )
+                    cur.execute(
+                        """
                         CREATE TABLE IF NOT EXISTS app_session (
                             id smallint PRIMARY KEY DEFAULT 1 CHECK (id = 1),
                             root_path text,
+                            root_paths text[] NOT NULL DEFAULT '{}',
                             search_tags text[] NOT NULL DEFAULT '{}',
                             search_mode text NOT NULL DEFAULT 'any',
                             last_image_id text,
@@ -173,6 +215,12 @@ def ensure_db_ready() -> None:
                             active_tab_id text,
                             updated_at timestamptz NOT NULL DEFAULT now()
                         )
+                        """
+                    )
+                    cur.execute(
+                        """
+                        ALTER TABLE app_session
+                        ADD COLUMN IF NOT EXISTS root_paths text[] NOT NULL DEFAULT '{}'
                         """
                     )
                     cur.execute(
@@ -192,6 +240,14 @@ def ensure_db_ready() -> None:
                         INSERT INTO app_session (id)
                         VALUES (1)
                         ON CONFLICT (id) DO NOTHING
+                        """
+                    )
+                    cur.execute(
+                        """
+                        UPDATE app_session
+                        SET root_paths = ARRAY[root_path]
+                        WHERE root_path IS NOT NULL
+                          AND cardinality(root_paths) = 0
                         """
                     )
                     cur.execute(
@@ -250,6 +306,12 @@ def ensure_db_ready() -> None:
                     )
                     cur.execute(
                         "CREATE INDEX IF NOT EXISTS images_root_hidden_sort_idx ON images(root_path, hidden, lower(path), path, id)"
+                    )
+                    cur.execute(
+                        "CREATE INDEX IF NOT EXISTS images_root_hidden_mtime_idx ON images(root_path, hidden, mtime, lower(path), path, id)"
+                    )
+                    cur.execute(
+                        "CREATE INDEX IF NOT EXISTS images_root_hidden_size_idx ON images(root_path, hidden, size, lower(path), path, id)"
                     )
                     cur.execute(
                         "CREATE INDEX IF NOT EXISTS tags_normalized_idx ON tags(normalized)"

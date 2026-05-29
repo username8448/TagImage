@@ -2,12 +2,14 @@ import asyncio
 import mimetypes
 import os
 import re
+import shutil
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -34,6 +36,7 @@ from ..config import (
 )
 from ..repo.content import (
     clean_tag_list,
+    folder_tree_rows,
     get_image_record,
     load_session,
     normalize_color,
@@ -58,7 +61,7 @@ from ..repo.db import (
     list_jobs,
     serialize_job,
 )
-from ..services.app_state import require_root, restore_root_from_session, set_root
+from ..services.app_state import get_roots, require_root, require_roots, restore_root_from_session, set_root
 from ..services.inline_worker import start_inline_worker_if_enabled
 from ..services.scanner import make_thumb_sync
 
@@ -68,7 +71,7 @@ except ImportError:
     dict_row = None
 
 
-app = FastAPI(title="ImgViewer")
+app = FastAPI(title="TagImage")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -99,6 +102,7 @@ class FolderRequest(BaseModel):
 
 class SessionPatch(BaseModel):
     root_path: Optional[str] = None
+    root_paths: Optional[List[str]] = None
     search_tags: Optional[List[str]] = None
     search_mode: Optional[str] = None
     last_image_id: Optional[str] = None
@@ -109,6 +113,67 @@ class SessionPatch(BaseModel):
 class ThumbRebuildRequest(BaseModel):
     stale_only: bool = True
     limit: Optional[int] = None
+
+
+def _is_local_request(request: Request) -> bool:
+    host = request.client.host if request.client else ""
+    return host in {"127.0.0.1", "::1", "localhost", "testclient"}
+
+
+def _pick_folder_with_command(command: list[str]) -> tuple[Optional[str], bool, Optional[str]]:
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=300)
+    except FileNotFoundError:
+        return None, False, None
+    except Exception as exc:
+        return None, False, str(exc)
+    path = result.stdout.strip()
+    if result.returncode == 0 and path:
+        return str(Path(path).expanduser().resolve()), False, None
+    if result.returncode == 1 and not result.stderr.strip():
+        return None, True, None
+    if result.returncode == 1 and "cancel" in result.stderr.lower():
+        return None, True, None
+    return None, False, result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
+
+
+def _pick_folder_native() -> dict[str, Any]:
+    initial = str(Path.home())
+    for binary, command in (
+        ("kdialog", ["kdialog", "--getexistingdirectory", initial]),
+        ("zenity", ["zenity", "--file-selection", "--directory", "--title", "Выберите папку", "--filename", f"{initial}/"]),
+        ("yad", ["yad", "--file-selection", "--directory", "--title", "Выберите папку", "--filename", f"{initial}/"]),
+        ("qarma", ["qarma", "--file-selection", "--directory", "--title", "Выберите папку", "--filename", f"{initial}/"]),
+        ("matedialog", ["matedialog", "--file-selection", "--directory", "--title", "Выберите папку", "--filename", f"{initial}/"]),
+    ):
+        if not shutil.which(binary):
+            continue
+        path, cancelled, error = _pick_folder_with_command(command)
+        if path:
+            return {"path": path}
+        if cancelled:
+            return {"path": None, "cancelled": True}
+
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        selected = filedialog.askdirectory(initialdir=initial, title="Выберите папку")
+        root.destroy()
+        if selected:
+            return {"path": str(Path(selected).expanduser().resolve())}
+        return {"path": None, "cancelled": True}
+    except Exception:
+        pass
+
+    detail = (
+        "Нативный выбор папки недоступен. "
+        "Установите kdialog, zenity, yad, qarma или matedialog, либо введите путь вручную."
+    )
+    raise RuntimeError(detail)
 
 
 @app.on_event("startup")
@@ -216,23 +281,36 @@ async def set_folder(req: FolderRequest):
         raise HTTPException(500, f"Database error: {exc}")
 
     job = enqueue_job(JOB_TYPE_RESCAN, {"root_path": str(root)})
-    return {"ok": True, "root": str(root), "job_id": job["id"]}
+    roots = [str(item) for item in get_roots()]
+    return {"ok": True, "root": str(root), "root_paths": roots, "job_id": job["id"]}
+
+
+@app.post("/api/folder/pick")
+async def pick_folder(request: Request):
+    if not _is_local_request(request):
+        raise HTTPException(403, "Folder picker is available only from localhost")
+    try:
+        return await asyncio.get_running_loop().run_in_executor(executor, _pick_folder_native)
+    except RuntimeError as exc:
+        raise HTTPException(501, str(exc))
 
 
 @app.get("/api/status")
 async def get_status():
     health = db_health()
-    if health["db_ready"] and state.ROOT_FOLDER is None:
+    if health["db_ready"] and state.ROOT_FOLDER is None and not get_roots():
         try:
             restore_root_from_session()
         except Exception:
             pass
-    root = str(state.ROOT_FOLDER) if state.ROOT_FOLDER is not None else None
+    roots = [str(item) for item in get_roots()]
+    root = str(state.ROOT_FOLDER) if state.ROOT_FOLDER is not None else (roots[-1] if roots else None)
     scan = _rescan_status()
     extra = _status_workers_and_queues()
     return {
         "ready": bool(root) and not scan["running"] and not scan.get("queued", False),
         "root": root,
+        "root_paths": roots,
         **scan,
         **health,
         **extra,
@@ -243,8 +321,9 @@ async def get_status():
 async def get_session():
     try:
         session = load_session()
-        if state.ROOT_FOLDER is None and session.get("root_path") and Path(session["root_path"]).is_dir():
-            set_root(session["root_path"], persist=False)
+        if state.ROOT_FOLDER is None and not get_roots():
+            restore_root_from_session()
+            session = load_session()
         return session
     except Exception as exc:
         raise HTTPException(500, f"Database error: {exc}")
@@ -259,6 +338,7 @@ async def patch_session(req: SessionPatch):
         except ValueError as exc:
             raise HTTPException(400, str(exc))
         payload["root_path"] = str(state.ROOT_FOLDER)
+        payload["root_paths"] = [str(item) for item in get_roots()]
     try:
         return save_session_fields(**payload)
     except Exception as exc:
@@ -275,13 +355,13 @@ async def list_images(
     mode: Optional[str] = Query("any", description="'any' or 'all'"),
     limit: Optional[int] = Query(None, description="page size"),
     cursor: Optional[str] = Query(None, description="cursor from previous page"),
-    sort: Optional[str] = Query("path_asc", description="only path_asc is currently supported"),
+    sort: Optional[str] = Query("date_desc", description="path/date/size sort mode"),
     include_total: bool = Query(False, description="include full filtered total count"),
 ):
-    root = require_root()
+    roots = require_roots()
     started = time.perf_counter()
     page = query_images_page(
-        root_path=str(root),
+        root_paths=[str(root) for root in roots],
         tags=tags,
         include_tags=include_tags,
         exclude_tags=exclude_tags,
@@ -306,6 +386,15 @@ async def list_images(
     return payload
 
 
+@app.get("/api/folders")
+async def list_folders():
+    try:
+        roots = [str(root) for root in require_roots()]
+    except HTTPException:
+        roots = []
+    return {"roots": roots, "items": folder_tree_rows(roots)}
+
+
 @app.get("/api/tags")
 async def list_all_tags():
     return {"tags": tag_summary_rows()}
@@ -321,7 +410,7 @@ async def create_tag(req: TagCreateRequest):
         with conn.cursor() as cur:
             from ..repo.content import ensure_tag
 
-            ensure_tag(cur, cleaned[0])
+            ensure_tag(cur, cleaned[0], user_defined=True)
     tag = tag_summary_by_norm(normalize_tag(cleaned[0]))
     return {
         "tag": tag
@@ -331,6 +420,7 @@ async def create_tag(req: TagCreateRequest):
             "image_count": 0,
             "auto_count": 0,
             "user_count": 0,
+            "user_defined": True,
             "is_auto": False,
         },
         "tags": tag_summary_rows(),
@@ -381,6 +471,7 @@ async def update_tag(tag: str, req: TagUpdateRequest):
             target_id = source["id"]
             if new_name is not None:
                 new_norm = normalize_tag(new_name)
+                cur.execute("DELETE FROM suppressed_auto_tags WHERE normalized = %s", (new_norm,))
                 source_is_auto = int(source["auto_count"] or 0) > 0
                 if source_is_auto and new_name != source["name"]:
                     raise HTTPException(400, "Folder tags cannot be renamed")
@@ -388,9 +479,11 @@ async def update_tag(tag: str, req: TagUpdateRequest):
                 if new_norm == source["normalized"]:
                     if new_name != source["name"]:
                         cur.execute(
-                            "UPDATE tags SET name = %s WHERE id = %s",
+                            "UPDATE tags SET name = %s, user_defined = true WHERE id = %s",
                             (new_name, source["id"]),
                         )
+                    elif not source_is_auto:
+                        cur.execute("UPDATE tags SET user_defined = true WHERE id = %s", (source["id"],))
                     final_norm = new_norm
                 else:
                     if source_is_auto:
@@ -424,11 +517,12 @@ async def update_tag(tag: str, req: TagUpdateRequest):
                             (target["id"], source["id"]),
                         )
                         cur.execute("DELETE FROM tags WHERE id = %s", (source["id"],))
+                        cur.execute("UPDATE tags SET user_defined = true WHERE id = %s", (target["id"],))
                         target_id = target["id"]
                         final_norm = target["normalized"]
                     else:
                         cur.execute(
-                            "UPDATE tags SET name = %s, normalized = %s WHERE id = %s",
+                            "UPDATE tags SET name = %s, normalized = %s, user_defined = true WHERE id = %s",
                             (new_name, new_norm, source["id"]),
                         )
                         target_id = source["id"]
@@ -452,6 +546,7 @@ async def delete_tag(tag: str):
                 SELECT
                     t.id,
                     t.name,
+                    t.normalized,
                     COUNT(DISTINCT CASE WHEN it.kind = 'auto' THEN it.image_id END) AS auto_count
                 FROM tags t
                 LEFT JOIN image_tags it ON it.tag_id = t.id
@@ -464,7 +559,14 @@ async def delete_tag(tag: str):
             if row is None:
                 raise HTTPException(404, "Tag not found")
             if int(row["auto_count"] or 0) > 0:
-                raise HTTPException(400, "Folder tags cannot be deleted")
+                cur.execute(
+                    """
+                    INSERT INTO suppressed_auto_tags (normalized, name)
+                    VALUES (%s, %s)
+                    ON CONFLICT (normalized) DO UPDATE SET name = EXCLUDED.name
+                    """,
+                    (row["normalized"], row["name"]),
+                )
             cur.execute("DELETE FROM tags WHERE id = %s", (row["id"],))
     return {"ok": True, "tags": tag_summary_rows()}
 
@@ -634,18 +736,21 @@ async def get_file(img_id: str):
 
 @app.post("/api/rescan")
 async def rescan():
-    root = require_root()
+    roots = require_roots()
     running = list_jobs(job_type=JOB_TYPE_RESCAN, state=JOB_STATE_RUNNING, limit=1)
     if running:
         active = serialize_job(running[0])
         return {"ok": False, "message": "Scan already running", "job_id": active["id"]}
 
-    job = enqueue_job(
-        JOB_TYPE_RESCAN,
-        {"root_path": str(root)},
-        max_attempts=RESCAN_MAX_ATTEMPTS,
-    )
-    return {"ok": True, "job_id": job["id"]}
+    jobs = [
+        enqueue_job(
+            JOB_TYPE_RESCAN,
+            {"root_path": str(root)},
+            max_attempts=RESCAN_MAX_ATTEMPTS,
+        )
+        for root in roots
+    ]
+    return {"ok": True, "job_id": jobs[0]["id"] if jobs else None, "job_ids": [job["id"] for job in jobs]}
 
 
 @app.get("/api/jobs/{job_id}")
@@ -668,19 +773,20 @@ async def get_jobs(
 
 @app.post("/api/thumbs/rebuild")
 async def enqueue_thumb_rebuild(req: ThumbRebuildRequest):
-    root = require_root()
-    root_str = str(root)
+    roots = require_roots()
+    root_map = {str(root): root for root in roots}
+    root_strings = list(root_map)
     max_rows = 0 if req.limit is None else max(0, min(int(req.limit), 200000))
 
     with db_connect(row_factory=dict_row) as conn:
         with conn.cursor() as cur:
             sql = """
-                SELECT id, path, thumb, mtime
+                SELECT id, root_path, path, thumb, mtime
                 FROM images
-                WHERE root_path = %s AND hidden = false
-                ORDER BY lower(path), path
+                WHERE root_path = ANY(%s) AND hidden = false
+                ORDER BY root_path, lower(path), path
             """
-            params: list[Any] = [root_str]
+            params: list[Any] = [root_strings]
             if max_rows > 0:
                 sql += " LIMIT %s"
                 params.append(max_rows)
@@ -691,6 +797,11 @@ async def enqueue_thumb_rebuild(req: ThumbRebuildRequest):
     queued_existing = 0
     skipped = 0
     for row in rows:
+        root_str = row["root_path"]
+        root = root_map.get(root_str)
+        if root is None:
+            skipped += 1
+            continue
         src = root / row["path"]
         thumb = root / row["thumb"]
         if req.stale_only:

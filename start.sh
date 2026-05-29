@@ -151,6 +151,44 @@ if [[ -n "$FOLDER" ]]; then
   echo -e "${GREEN}✓${RESET}  Папка: $FOLDER"
 fi
 
+# ── Build TypeScript frontend ───────────────────────────────────────
+FRONTEND_BUNDLE="$SCRIPT_DIR/static/dist/app.js"
+
+if [[ ! -f "$SCRIPT_DIR/package.json" ]]; then
+  echo -e "${RED}✗  package.json не найден.${RESET}"
+  echo -e "   Невозможно собрать TypeScript frontend."
+  exit 1
+fi
+
+if ! command -v npm &>/dev/null; then
+  echo -e "${RED}✗  Node.js/npm required for TS frontend build.${RESET}"
+  echo -e "   Установи Node.js и npm, затем повтори запуск."
+  exit 1
+fi
+
+if [[ ! -d "$SCRIPT_DIR/node_modules" ]]; then
+  echo -e "${RED}✗  node_modules не найден.${RESET}"
+  if [[ -f "$SCRIPT_DIR/package-lock.json" ]]; then
+    echo -e "   Установи frontend-зависимости командой: ${YELLOW}npm ci${RESET}"
+  else
+    echo -e "   Установи frontend-зависимости командой: ${YELLOW}npm install${RESET}"
+  fi
+  exit 1
+fi
+
+echo -e "${CYAN}→${RESET}  Собираю TypeScript frontend…"
+if ! npm run build:frontend; then
+  echo -e "${RED}✗  Сборка frontend не удалась.${RESET}"
+  exit 1
+fi
+
+if [[ ! -s "$FRONTEND_BUNDLE" ]]; then
+  echo -e "${RED}✗  Frontend bundle не создан: $FRONTEND_BUNDLE${RESET}"
+  exit 1
+fi
+
+echo -e "${GREEN}✓${RESET}  Frontend bundle: static/dist/app.js"
+
 # ── Open browser ────────────────────────────────────────────────────
 URL="http://localhost:$PORT"
 
@@ -181,8 +219,7 @@ fi
 
 # Use run.py if folder given (it pre-loads), else start uvicorn directly
 if [[ ${#LAUNCH_ARGS[@]} -gt 0 ]]; then
-  exec "$PYTHON" run.py "${LAUNCH_ARGS[@]}" --port "$PORT" 2>/dev/null || \
-  exec "$PYTHON" -m uvicorn main:app --host 0.0.0.0 --port "$PORT" --log-level warning
+  exec "$PYTHON" run.py "${LAUNCH_ARGS[@]}" --port "$PORT" --no-browser
 else
   exec "$PYTHON" -m uvicorn main:app --host 0.0.0.0 --port "$PORT" --log-level warning
 fi

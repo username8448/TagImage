@@ -16,6 +16,9 @@ except ImportError:
     dict_row = None
 
 
+IMAGE_SORTS = {"path_asc", "path_desc", "date_desc", "date_asc", "size_desc", "size_asc"}
+
+
 def normalize_color(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
@@ -27,22 +30,61 @@ def normalize_color(value: Optional[str]) -> Optional[str]:
     return color.upper()
 
 
-def ensure_tag(cur, name: str) -> Optional[int]:
+def ensure_tag(cur, name: str, *, user_defined: bool = False) -> Optional[int]:
     name = " ".join(name.strip().split())
     norm = normalize_tag(name)
     if not name or not norm:
         return None
+    if user_defined:
+        cur.execute("DELETE FROM suppressed_auto_tags WHERE normalized = %s", (norm,))
     cur.execute(
         """
-        INSERT INTO tags (name, normalized)
-        VALUES (%s, %s)
-        ON CONFLICT (normalized) DO UPDATE SET name = tags.name
+        INSERT INTO tags (name, normalized, user_defined)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (normalized) DO UPDATE SET
+            name = CASE WHEN EXCLUDED.user_defined THEN EXCLUDED.name ELSE tags.name END,
+            user_defined = tags.user_defined OR EXCLUDED.user_defined
         RETURNING id
         """,
-        (name, norm),
+        (name, norm, user_defined),
     )
     row = cur.fetchone()
     return row[0] if row else None
+
+
+def filter_suppressed_auto_tags(cur, tags: list[str]) -> list[str]:
+    cleaned = clean_tag_list(tags)
+    if not cleaned:
+        return []
+    normalized = [normalize_tag(tag) for tag in cleaned]
+    cur.execute(
+        "SELECT normalized FROM suppressed_auto_tags WHERE normalized = ANY(%s)",
+        (normalized,),
+    )
+    suppressed = {row[0] for row in cur.fetchall()}
+    return [tag for tag in cleaned if normalize_tag(tag) not in suppressed]
+
+
+def cleanup_hidden_image_tag_data(cur) -> None:
+    cur.execute(
+        """
+        DELETE FROM image_tags it
+        USING images i
+        WHERE it.image_id = i.id
+          AND i.hidden = true
+        """
+    )
+    cur.execute(
+        """
+        DELETE FROM tags t
+        WHERE t.user_defined = false
+          AND NOT EXISTS (
+              SELECT 1
+              FROM image_tags it
+              WHERE it.tag_id = t.id
+          )
+        """
+    )
 
 
 def tag_summary_rows() -> list[dict[str, Any]]:
@@ -56,12 +98,15 @@ def tag_summary_rows() -> list[dict[str, Any]]:
                     t.name,
                     t.normalized,
                     t.color,
-                    COUNT(DISTINCT it.image_id) AS image_count,
-                    COUNT(DISTINCT CASE WHEN it.kind = 'auto' THEN it.image_id END) AS auto_count,
-                    COUNT(DISTINCT CASE WHEN it.kind = 'user' THEN it.image_id END) AS user_count
+                    t.user_defined,
+                    COUNT(DISTINCT CASE WHEN i.id IS NOT NULL THEN it.image_id END) AS image_count,
+                    COUNT(DISTINCT CASE WHEN i.id IS NOT NULL AND it.kind = 'auto' THEN it.image_id END) AS auto_count,
+                    COUNT(DISTINCT CASE WHEN i.id IS NOT NULL AND it.kind = 'user' THEN it.image_id END) AS user_count
                 FROM tags t
                 LEFT JOIN image_tags it ON it.tag_id = t.id
+                LEFT JOIN images i ON i.id = it.image_id AND i.hidden = false
                 GROUP BY t.id
+                HAVING t.user_defined OR COUNT(DISTINCT i.id) > 0
                 ORDER BY lower(t.name), t.name
                 """
             )
@@ -74,6 +119,7 @@ def tag_summary_rows() -> list[dict[str, Any]]:
             "image_count": int(row["image_count"] or 0),
             "auto_count": int(row["auto_count"] or 0),
             "user_count": int(row["user_count"] or 0),
+            "user_defined": bool(row["user_defined"]),
             "is_auto": int(row["auto_count"] or 0) > 0,
         }
         for row in rows
@@ -89,9 +135,11 @@ def tag_summary_by_norm(norm: str) -> Optional[dict[str, Any]]:
 
 def replace_image_tags(cur, image_id: str, tags: list[str], kind: str) -> None:
     cleaned = clean_tag_list(tags)
+    if kind == "auto":
+        cleaned = filter_suppressed_auto_tags(cur, cleaned)
     cur.execute("DELETE FROM image_tags WHERE image_id = %s AND kind = %s", (image_id, kind))
     for tag in cleaned:
-        tag_id = ensure_tag(cur, tag)
+        tag_id = ensure_tag(cur, tag, user_defined=kind == "user")
         if tag_id is None:
             continue
         cur.execute(
@@ -110,7 +158,7 @@ def load_session() -> dict[str, Any]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT root_path, search_tags, search_mode, last_image_id, tabs, active_tab_id
+                SELECT root_path, root_paths, search_tags, search_mode, last_image_id, tabs, active_tab_id
                 FROM app_session
                 WHERE id = 1
                 """
@@ -118,6 +166,7 @@ def load_session() -> dict[str, Any]:
             row = cur.fetchone()
     return {
         "root_path": row["root_path"] if row else None,
+        "root_paths": list(row["root_paths"] or []) if row else [],
         "search_tags": list(row["search_tags"] or []) if row else [],
         "search_mode": row["search_mode"] if row else "any",
         "last_image_id": row["last_image_id"] if row else None,
@@ -133,7 +182,7 @@ def save_session_fields(**fields: Any) -> dict[str, Any]:
     if "search_tags" in fields and fields["search_tags"] is not None:
         fields["search_tags"] = [normalize_tag(t) for t in clean_tag_list(fields["search_tags"])]
 
-    allowed = {"root_path", "search_tags", "search_mode", "last_image_id", "tabs", "active_tab_id"}
+    allowed = {"root_path", "root_paths", "search_tags", "search_mode", "last_image_id", "tabs", "active_tab_id"}
     updates = [(key, value) for key, value in fields.items() if key in allowed]
     if updates:
         assignments = ", ".join(f"{key} = %s" for key, _ in updates)
@@ -173,7 +222,7 @@ def get_image_record(img_id: str) -> Optional[dict[str, Any]]:
             return cur.fetchone()
 
 
-def _decode_cursor(raw: Optional[str]) -> Optional[tuple[str, str, str]]:
+def _decode_cursor(raw: Optional[str]) -> Optional[dict[str, Any]]:
     if not raw:
         return None
     try:
@@ -183,14 +232,85 @@ def _decode_cursor(raw: Optional[str]) -> Optional[tuple[str, str, str]]:
         image_id = str(payload.get("id") or "")
         if not image_id:
             return None
-        return (lower_path, path, image_id)
+        payload["lower_path"] = lower_path
+        payload["path"] = path
+        payload["id"] = image_id
+        payload["sort"] = str(payload.get("sort") or "path_asc")
+        payload["mtime"] = int(payload.get("mtime") or 0)
+        payload["size"] = int(payload.get("size") or 0)
+        return payload
     except Exception:
         return None
 
 
-def _encode_cursor(lower_path: str, path: str, image_id: str) -> str:
-    raw = json.dumps({"lower_path": lower_path, "path": path, "id": image_id}, separators=(",", ":"))
+def _encode_cursor(sort_mode: str, row: dict[str, Any]) -> str:
+    payload: dict[str, Any] = {
+        "sort": sort_mode,
+        "lower_path": row["lower_path"],
+        "path": row["path"],
+        "id": row["id"],
+    }
+    if sort_mode.startswith("date_"):
+        payload["mtime"] = int(row["mtime"] or 0)
+    if sort_mode.startswith("size_"):
+        payload["size"] = int(row["size"] or 0)
+    raw = json.dumps(payload, separators=(",", ":"))
     return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("utf-8")
+
+
+def _sort_order_sql(sort_mode: str) -> str:
+    if sort_mode == "path_desc":
+        return "lower_path DESC, path DESC, id DESC"
+    if sort_mode == "date_desc":
+        return "mtime DESC, lower_path, path, id"
+    if sort_mode == "date_asc":
+        return "mtime ASC, lower_path, path, id"
+    if sort_mode == "size_desc":
+        return "size DESC, lower_path, path, id"
+    if sort_mode == "size_asc":
+        return "size ASC, lower_path, path, id"
+    return "lower_path, path, id"
+
+
+def _cursor_filter(sort_mode: str, cursor_payload: Optional[dict[str, Any]]) -> tuple[Optional[str], list[Any]]:
+    if cursor_payload is None:
+        return None, []
+    if cursor_payload.get("sort") != sort_mode:
+        return None, []
+
+    lower_path = str(cursor_payload.get("lower_path") or "")
+    path = str(cursor_payload.get("path") or "")
+    image_id = str(cursor_payload.get("id") or "")
+    if not image_id:
+        return None, []
+
+    if sort_mode == "path_desc":
+        return "(lower(i.path), i.path, i.id) < (%s, %s, %s)", [lower_path, path, image_id]
+    if sort_mode == "date_desc":
+        value = int(cursor_payload.get("mtime") or 0)
+        return (
+            "(i.mtime < %s OR (i.mtime = %s AND (lower(i.path), i.path, i.id) > (%s, %s, %s)))",
+            [value, value, lower_path, path, image_id],
+        )
+    if sort_mode == "date_asc":
+        value = int(cursor_payload.get("mtime") or 0)
+        return (
+            "(i.mtime > %s OR (i.mtime = %s AND (lower(i.path), i.path, i.id) > (%s, %s, %s)))",
+            [value, value, lower_path, path, image_id],
+        )
+    if sort_mode == "size_desc":
+        value = int(cursor_payload.get("size") or 0)
+        return (
+            "(i.size < %s OR (i.size = %s AND (lower(i.path), i.path, i.id) > (%s, %s, %s)))",
+            [value, value, lower_path, path, image_id],
+        )
+    if sort_mode == "size_asc":
+        value = int(cursor_payload.get("size") or 0)
+        return (
+            "(i.size > %s OR (i.size = %s AND (lower(i.path), i.path, i.id) > (%s, %s, %s)))",
+            [value, value, lower_path, path, image_id],
+        )
+    return "(lower(i.path), i.path, i.id) > (%s, %s, %s)", [lower_path, path, image_id]
 
 
 def _normalize_limit(limit: Optional[int]) -> int:
@@ -201,7 +321,8 @@ def _normalize_limit(limit: Optional[int]) -> int:
 
 def query_images_page(
     *,
-    root_path: str,
+    root_path: Optional[str] = None,
+    root_paths: Optional[list[str]] = None,
     tags: Optional[str] = None,
     include_tags: Optional[str] = None,
     exclude_tags: Optional[str] = None,
@@ -214,9 +335,14 @@ def query_images_page(
 ) -> dict[str, Any]:
     ensure_db_ready()
     limit_value = _normalize_limit(limit)
-    sort_mode = sort or "path_asc"
-    if sort_mode != "path_asc":
-        raise HTTPException(400, "Unsupported sort. Allowed: path_asc")
+    roots = [str(root) for root in (root_paths or ([root_path] if root_path else [])) if root]
+    roots = list(dict.fromkeys(roots))
+    if not roots:
+        raise HTTPException(400, "No folder set")
+    sort_mode = sort or "date_desc"
+    if sort_mode not in IMAGE_SORTS:
+        allowed = ", ".join(sorted(IMAGE_SORTS))
+        raise HTTPException(400, f"Unsupported sort. Allowed: {allowed}")
 
     include_source = include_tags if include_tags is not None else tags
     include_list = parse_csv_tags(include_source)
@@ -228,17 +354,21 @@ def query_images_page(
     if resolved_mode not in VALID_MATCH_MODES:
         resolved_mode = "any"
 
-    cursor_parts = _decode_cursor(cursor)
+    cursor_payload = _decode_cursor(cursor)
 
-    filters: list[str] = ["i.root_path = %s", "i.hidden = false"]
-    params: list[Any] = [root_path]
+    base_filters: list[str] = ["i.root_path = ANY(%s)", "i.hidden = false"]
+    base_params: list[Any] = [roots]
+    filters = list(base_filters)
+    params: list[Any] = list(base_params)
 
-    if cursor_parts is not None:
-        filters.append("(lower(i.path), i.path, i.id) > (%s, %s, %s)")
-        params.extend(cursor_parts)
+    cursor_sql, cursor_params = _cursor_filter(sort_mode, cursor_payload)
+    if cursor_sql is not None:
+        filters.append(cursor_sql)
+        params.extend(cursor_params)
 
     join_sql = ""
     having_clauses: list[str] = []
+    having_params: list[Any] = []
 
     if include_list or exclude_list:
         join_sql = "LEFT JOIN image_tags it ON it.image_id = i.id LEFT JOIN tags t ON t.id = it.tag_id"
@@ -248,25 +378,28 @@ def query_images_page(
             having_clauses.append(
                 "COUNT(DISTINCT CASE WHEN t.normalized = ANY(%s) THEN t.normalized END) = %s"
             )
-            params.append(include_list)
-            params.append(len(include_list))
+            having_params.append(include_list)
+            having_params.append(len(include_list))
         else:
             having_clauses.append(
                 "COUNT(DISTINCT CASE WHEN t.normalized = ANY(%s) THEN t.normalized END) > 0"
             )
-            params.append(include_list)
+            having_params.append(include_list)
 
     if exclude_list:
         having_clauses.append(
             "COUNT(DISTINCT CASE WHEN t.normalized = ANY(%s) THEN t.normalized END) = 0"
         )
-        params.append(exclude_list)
+        having_params.append(exclude_list)
 
+    params.extend(having_params)
     where_sql = " AND ".join(filters)
+    total_where_sql = " AND ".join(base_filters)
     group_by_sql = "GROUP BY i.id"
     having_sql = f"HAVING {' AND '.join(having_clauses)}" if having_clauses else ""
 
     base_from = f"FROM images i {join_sql} WHERE {where_sql}"
+    total_base_from = f"FROM images i {join_sql} WHERE {total_where_sql}"
 
     select_filtered = f"""
         SELECT
@@ -282,40 +415,46 @@ def query_images_page(
         {group_by_sql}
         {having_sql}
     """
-    if include_total:
-        query = f"""
-            WITH filtered AS (
-                {select_filtered}
-            ),
-            counted AS (
-                SELECT COUNT(*)::bigint AS total FROM filtered
-            )
-            SELECT f.id, f.path, f.thumb, f.size, f.mtime, f.width, f.height, f.lower_path, c.total
-            FROM filtered f
-            CROSS JOIN counted c
-            ORDER BY f.lower_path, f.path, f.id
-            LIMIT %s
-        """
-    else:
-        query = f"""
-            {select_filtered}
-            ORDER BY lower_path, path, id
-            LIMIT %s
-        """
+    select_total_filtered = f"""
+        SELECT i.id
+        {total_base_from}
+        {group_by_sql}
+        {having_sql}
+    """
+    order_sql = _sort_order_sql(sort_mode)
+
+    query = f"""
+        {select_filtered}
+        ORDER BY {order_sql}
+        LIMIT %s
+    """
     query_params = [*params, limit_value + 1]
+    total_params = [*base_params, *having_params]
 
     with db_connect(row_factory=dict_row) as conn:
         with conn.cursor() as cur:
             cur.execute(query, query_params)
             raw_rows = cur.fetchall()
+            total = None
+            if include_total:
+                cur.execute(
+                    f"""
+                    WITH filtered AS (
+                        {select_total_filtered}
+                    )
+                    SELECT COUNT(*)::bigint AS total FROM filtered
+                    """,
+                    total_params,
+                )
+                total_row = cur.fetchone()
+                total = int(total_row["total"] or 0) if total_row else 0
 
     has_more = len(raw_rows) > limit_value
     page_rows = raw_rows[:limit_value]
-    total = int(page_rows[0]["total"]) if include_total and page_rows else None
     next_cursor = None
     if has_more and page_rows:
         last = page_rows[-1]
-        next_cursor = _encode_cursor(last["lower_path"], last["path"], last["id"])
+        next_cursor = _encode_cursor(sort_mode, last)
 
     rows = [
         {
@@ -364,6 +503,27 @@ def fetch_tags_for_image_ids(ids: list[str]) -> dict[str, dict[str, list[str]]]:
             for row in cur.fetchall():
                 tags_by_image[row["image_id"]][row["kind"]].append(row["name"])
     return tags_by_image
+
+
+def folder_tree_rows(root_paths: list[str]) -> list[dict[str, Any]]:
+    roots = [str(root) for root in root_paths if root]
+    if not roots:
+        return []
+    ensure_db_ready()
+    with db_connect(row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT root_path, path
+                FROM images
+                WHERE root_path = ANY(%s)
+                  AND hidden = false
+                ORDER BY root_path, lower(path), path
+                """,
+                (roots,),
+            )
+            rows = cur.fetchall()
+    return [{"root_path": row["root_path"], "path": row["path"]} for row in rows]
 
 
 def rows_to_images(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

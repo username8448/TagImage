@@ -41,16 +41,16 @@ def worker_loop(*, poll_interval: float = 1.0, once: bool = False, worker_id: st
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ImgViewer background worker")
+    parser = argparse.ArgumentParser(description="TagImage background worker")
     parser.add_argument("--poll", type=float, default=1.0, help="queue poll interval in seconds")
     parser.add_argument("--once", action="store_true", help="process one job and exit")
     parser.add_argument("--worker-id", default=None, help="optional custom worker id")
     args = parser.parse_args()
 
     worker_id = args.worker_id or f"worker-{socket.gethostname()}-{int(time.time())}"
-    print(f"[imgviewer-worker] started as {worker_id}")
+    print(f"[tagimage-worker] started as {worker_id}")
     processed = worker_loop(poll_interval=max(0.1, args.poll), once=args.once, worker_id=worker_id)
-    print(f"[imgviewer-worker] stopped, processed={processed}")
+    print(f"[tagimage-worker] stopped, processed={processed}")
 
 
 if __name__ == "__main__":

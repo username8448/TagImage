@@ -1,3 +1,166 @@
+type MatchMode = 'any' | 'all';
+type SortMode = 'path_asc' | 'path_desc' | 'date_desc' | 'date_asc' | 'size_desc' | 'size_asc';
+type SettingsTab = 'general' | 'tags' | 'graph';
+type GraphScope = 'current' | 'all';
+type TagAdminSort = 'name' | 'image_count' | 'user_count' | 'auto_count';
+type TagKind = 'include' | 'exclude';
+type ElementConstructor<T extends Element> = { new (...args: any[]): T };
+type JsonRecord = Record<string, unknown>;
+
+interface TagMeta {
+  name: string;
+  normalized: string;
+  color: string | null;
+  image_count: number;
+  auto_count: number;
+  user_count: number;
+  is_auto: boolean;
+}
+
+interface ImageItem {
+  id: string;
+  path: string;
+  thumb_url?: string;
+  tags?: string[];
+  auto_tags?: string[];
+  folder_tags?: string[];
+  user_tags?: string[];
+  width?: number;
+  height?: number;
+  aspect_ratio?: number;
+  size?: number;
+  mtime?: number;
+}
+
+interface GalleryTab {
+  id: string;
+  title: string;
+  includeTags: string[];
+  excludeTags: string[];
+  matchMode: MatchMode;
+  sortMode: SortMode;
+  lastImageId: string | null;
+  scrollTop: number;
+}
+
+interface FolderTreeItem {
+  root_path: string;
+  path: string;
+}
+
+interface FolderNode {
+  name: string;
+  children: Map<string, FolderNode>;
+}
+
+interface StatusResponse {
+  db_ready?: boolean;
+  db_error?: string;
+  root_paths?: string[];
+  root?: string;
+  running?: boolean;
+  queued?: boolean;
+  done?: number;
+  total?: number;
+  error?: string;
+}
+
+interface ImagePage {
+  total?: unknown;
+  next_cursor?: string | null;
+  has_more?: boolean;
+}
+
+interface TagInputParse {
+  prefix: string;
+  value: string;
+}
+
+interface GraphBaseNode {
+  id: string;
+  type: 'tag' | 'image';
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  r: number;
+}
+
+interface GraphTagNode extends GraphBaseNode {
+  type: 'tag';
+  tag: string;
+  label: string;
+}
+
+interface GraphImageNode extends GraphBaseNode {
+  type: 'image';
+  imageId: string;
+  image: ImageItem;
+  tags: string[];
+}
+
+type GraphNode = GraphTagNode | GraphImageNode;
+
+interface GraphEdge {
+  source: string;
+  target: string;
+}
+
+interface GraphPoint {
+  screenX: number;
+  screenY: number;
+  x: number;
+  y: number;
+}
+
+interface GraphState {
+  open: boolean;
+  scope: GraphScope;
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  scale: number;
+  panX: number;
+  panY: number;
+  dragNode: GraphNode | null;
+  isPanning: boolean;
+  pointerMoved: boolean;
+  lastX: number;
+  lastY: number;
+  tick: number;
+  raf: number | null;
+  needsRebuild: boolean;
+  query: string;
+  nodeLimit: number;
+  canvas: HTMLCanvasElement;
+  ctx: CanvasRenderingContext2D;
+}
+
+interface PreviewModalOptions {
+  modalId: string;
+  canvasId: string;
+  closeId: string;
+  zoomId: string;
+  minScale: number;
+  maxScale: number;
+  initialViewportFill: number;
+  messageType: string;
+  postToParent: boolean;
+}
+
+interface FishController {
+  suggestion: string;
+  update?: () => void;
+}
+
+interface TagChipOptions {
+  auto?: boolean;
+  className?: string;
+  count?: boolean;
+  exclude?: boolean;
+  removable?: boolean;
+  actionKind?: 'include' | 'exclude' | '';
+}
+
 /*!
  * PreviewModal standalone lightbox for canvas images.
  *
@@ -7,133 +170,255 @@
  * - #preview-modal-canvas     (canvas used inside lightbox)
  * - #zoom-level               (zoom label, e.g. "100%")
  */
-(function initPreviewModalStandalone(global) {
-  "use strict";
+const PREVIEW_MODAL_DEFAULTS: PreviewModalOptions = {
+  modalId: "preview-modal",
+  canvasId: "preview-modal-canvas",
+  closeId: "preview-close",
+  zoomId: "zoom-level",
+  minScale: 0.1,
+  maxScale: 10,
+  initialViewportFill: 0.6,
+  messageType: "web-tools:preview-modal",
+  postToParent: true
+};
 
-  var DEFAULTS = {
-    modalId: "preview-modal",
-    canvasId: "preview-modal-canvas",
-    closeId: "preview-close",
-    zoomId: "zoom-level",
-    minScale: 0.1,
-    maxScale: 10,
-    initialViewportFill: 0.6,
-    messageType: "web-tools:preview-modal",
-    postToParent: true
+function clamp(value: number, min: number, max: number): number {
+  if (value < min) return min;
+  if (value > max) return max;
+  return value;
+}
+
+function requireElement<T extends Element>(
+  id: string,
+  expected: ElementConstructor<T>,
+  message: string
+): T {
+  const node = document.getElementById(id);
+  if (!(node instanceof expected)) {
+    throw new Error(`${message} (id="${id}")`);
+  }
+  return node;
+}
+
+function optionalElement<T extends Element>(id: string, expected: ElementConstructor<T>): T | null {
+  const node = document.getElementById(id);
+  return node instanceof expected ? node : null;
+}
+
+function requiredHtml(id: string): HTMLElement {
+  return requireElement(id, HTMLElement, "Required page element is missing");
+}
+
+function optionalHtml(id: string): HTMLElement | null {
+  return optionalElement(id, HTMLElement);
+}
+
+function requiredInput(id: string): HTMLInputElement {
+  return requireElement(id, HTMLInputElement, "Required input is missing");
+}
+
+function optionalInput(id: string): HTMLInputElement | null {
+  return optionalElement(id, HTMLInputElement);
+}
+
+function requiredAnchor(id: string): HTMLAnchorElement {
+  return requireElement(id, HTMLAnchorElement, "Required link is missing");
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isRecord(value: unknown): value is JsonRecord {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+async function readJsonRecord(response: Response): Promise<JsonRecord> {
+  const value: unknown = await response.json();
+  return isRecord(value) ? value : {};
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.map(item => String(item)).filter(Boolean) : [];
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? numberValue : undefined;
+}
+
+function normalizeImageItem(value: unknown): ImageItem | null {
+  if (!isRecord(value)) return null;
+  const id = String(value.id || '');
+  const path = String(value.path || '');
+  if (!id || !path) return null;
+  return {
+    id,
+    path,
+    thumb_url: typeof value.thumb_url === 'string' ? value.thumb_url : undefined,
+    tags: stringArray(value.tags),
+    auto_tags: stringArray(value.auto_tags),
+    folder_tags: stringArray(value.folder_tags),
+    user_tags: stringArray(value.user_tags),
+    width: optionalNumber(value.width),
+    height: optionalNumber(value.height),
+    aspect_ratio: optionalNumber(value.aspect_ratio),
+    size: optionalNumber(value.size),
+    mtime: optionalNumber(value.mtime)
   };
+}
 
-  function mergeOptions(options) {
-    var merged = {};
-    var key;
-    for (key in DEFAULTS) {
-      if (Object.prototype.hasOwnProperty.call(DEFAULTS, key)) {
-        merged[key] = DEFAULTS[key];
-      }
-    }
-    if (!options || typeof options !== "object") return merged;
-    for (key in options) {
-      if (Object.prototype.hasOwnProperty.call(options, key) && options[key] !== undefined) {
-        merged[key] = options[key];
-      }
-    }
-    return merged;
+function imageArray(value: unknown): ImageItem[] {
+  return Array.isArray(value)
+    ? value.map(normalizeImageItem).filter((item): item is ImageItem => Boolean(item))
+    : [];
+}
+
+function imagesFromRecord(value: JsonRecord): ImageItem[] {
+  const items = imageArray(value.items);
+  return items.length || Array.isArray(value.items) ? items : imageArray(value.images);
+}
+
+function imagePage(value: unknown): ImagePage | null {
+  if (!isRecord(value)) return null;
+  return {
+    total: value.total,
+    next_cursor: typeof value.next_cursor === 'string' ? value.next_cursor : null,
+    has_more: Boolean(value.has_more)
+  };
+}
+
+function statusResponse(value: JsonRecord): StatusResponse {
+  return {
+    db_ready: Boolean(value.db_ready),
+    db_error: typeof value.db_error === 'string' ? value.db_error : undefined,
+    root_paths: stringArray(value.root_paths),
+    root: typeof value.root === 'string' ? value.root : undefined,
+    running: Boolean(value.running),
+    queued: Boolean(value.queued),
+    done: optionalNumber(value.done),
+    total: optionalNumber(value.total),
+    error: typeof value.error === 'string' ? value.error : undefined
+  };
+}
+
+function normalizeTagKind(kind: string | undefined): TagKind {
+  return kind === 'exclude' ? 'exclude' : 'include';
+}
+
+function actionValue(el: HTMLElement): string | undefined {
+  if (el instanceof HTMLInputElement || el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement) {
+    return el.value;
   }
+  return undefined;
+}
 
-  function clamp(value, min, max) {
-    if (value < min) return min;
-    if (value > max) return max;
-    return value;
-  }
+function getCanvas2DContext(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Could not obtain 2D context from preview canvas.");
+  return ctx;
+}
 
-  function requireElement(id, expected, message) {
-    var node = document.getElementById(id);
-    if (!(node instanceof expected)) {
-      throw new Error(message + " (id=\"" + id + "\")");
-    }
-    return node;
-  }
+function eventTargetElement(event: Event): HTMLElement | null {
+  return event.target instanceof HTMLElement ? event.target : null;
+}
 
-  function getCanvas2DContext(canvas) {
-    var ctx = canvas.getContext("2d");
-    if (!ctx) throw new Error("Could not obtain 2D context from preview canvas.");
-    return ctx;
-  }
+function closestFromEvent(event: Event, selector: string): HTMLElement | null {
+  return eventTargetElement(event)?.closest(selector) as HTMLElement | null;
+}
 
-  function PreviewModal(options) {
-    this.options = mergeOptions(options);
+function isTextEntryTarget(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement && ['INPUT', 'TEXTAREA'].includes(target.tagName);
+}
+
+class PreviewModal {
+  readonly options: PreviewModalOptions;
+  readonly modal: HTMLElement;
+  readonly canvas: HTMLCanvasElement;
+  readonly closeBtn: HTMLElement;
+  readonly zoomLevel: HTMLElement;
+  readonly ctx: CanvasRenderingContext2D;
+  readonly onClosed?: () => void;
+  isOpen = false;
+  scale = 1;
+  minScale: number;
+  maxScale: number;
+  offsetX = 0;
+  offsetY = 0;
+  isDragging = false;
+  hasDragged = false;
+  dragStartX = 0;
+  dragStartY = 0;
+  lastX = 0;
+  lastY = 0;
+  imageWidth = 0;
+  imageHeight = 0;
+  containerWidth = 0;
+  containerHeight = 0;
+
+  private readonly boundWheel = this.handleWheel.bind(this);
+  private readonly boundMouseDown = this.handleMouseDown.bind(this);
+  private readonly boundMouseMove = this.handleMouseMove.bind(this);
+  private readonly boundMouseUp = this.handleMouseUp.bind(this);
+  private readonly boundKeyDown = this.handleKeyDown.bind(this);
+  private readonly boundBackdropClick = this.handleBackdropClick.bind(this);
+  private readonly boundCloseClick = this.close.bind(this);
+
+  constructor(options: Partial<PreviewModalOptions> = {}, onClosed?: () => void) {
+    this.options = {...PREVIEW_MODAL_DEFAULTS, ...options};
     this.modal = requireElement(this.options.modalId, HTMLElement, "Preview modal element is missing");
     this.canvas = requireElement(this.options.canvasId, HTMLCanvasElement, "Preview modal canvas is missing");
     this.closeBtn = requireElement(this.options.closeId, HTMLElement, "Preview close button is missing");
     this.zoomLevel = requireElement(this.options.zoomId, HTMLElement, "Preview zoom label is missing");
     this.ctx = getCanvas2DContext(this.canvas);
-    this.isOpen = false;
-    this.scale = 1;
     this.minScale = Number(this.options.minScale);
     this.maxScale = Number(this.options.maxScale);
-    this.offsetX = 0;
-    this.offsetY = 0;
-    this.isDragging = false;
-    this.hasDragged = false;
-    this.dragStartX = 0;
-    this.dragStartY = 0;
-    this.lastX = 0;
-    this.lastY = 0;
-    this.imageWidth = 0;
-    this.imageHeight = 0;
-    this.containerWidth = 0;
-    this.containerHeight = 0;
-    if (!Number.isFinite(this.minScale) || this.minScale <= 0) this.minScale = DEFAULTS.minScale;
-    if (!Number.isFinite(this.maxScale) || this.maxScale <= this.minScale) this.maxScale = DEFAULTS.maxScale;
-    this._boundWheel = this.handleWheel.bind(this);
-    this._boundMouseDown = this.handleMouseDown.bind(this);
-    this._boundMouseMove = this.handleMouseMove.bind(this);
-    this._boundMouseUp = this.handleMouseUp.bind(this);
-    this._boundKeyDown = this.handleKeyDown.bind(this);
-    this._boundBackdropClick = this.handleBackdropClick.bind(this);
-    this._boundCloseClick = this.close.bind(this);
+    this.onClosed = onClosed;
+    if (!Number.isFinite(this.minScale) || this.minScale <= 0) this.minScale = PREVIEW_MODAL_DEFAULTS.minScale;
+    if (!Number.isFinite(this.maxScale) || this.maxScale <= this.minScale) this.maxScale = PREVIEW_MODAL_DEFAULTS.maxScale;
     this.initEventListeners();
   }
 
-  PreviewModal.prototype.notifyShell = function notifyShell(open) {
+  private notifyShell(open: boolean): void {
     if (!this.options.postToParent) return;
-    if (!global.parent || global.parent === global) return;
-    global.parent.postMessage({ type: this.options.messageType, open: Boolean(open) }, "*");
-  };
+    if (!window.parent || window.parent === window) return;
+    window.parent.postMessage({ type: this.options.messageType, open: Boolean(open) }, "*");
+  }
 
-  PreviewModal.prototype.initEventListeners = function initEventListeners() {
-    this.closeBtn.addEventListener("click", this._boundCloseClick);
-    this.modal.addEventListener("click", this._boundBackdropClick);
-    document.addEventListener("keydown", this._boundKeyDown);
-    this.canvas.addEventListener("wheel", this._boundWheel, { passive: false });
-    this.canvas.addEventListener("mousedown", this._boundMouseDown);
-    this.canvas.addEventListener("mousemove", this._boundMouseMove);
-    this.canvas.addEventListener("mouseup", this._boundMouseUp);
-    this.canvas.addEventListener("mouseleave", this._boundMouseUp);
-  };
+  private initEventListeners(): void {
+    this.closeBtn.addEventListener("click", this.boundCloseClick);
+    this.modal.addEventListener("click", this.boundBackdropClick);
+    document.addEventListener("keydown", this.boundKeyDown);
+    this.canvas.addEventListener("wheel", this.boundWheel, { passive: false });
+    this.canvas.addEventListener("mousedown", this.boundMouseDown);
+    this.canvas.addEventListener("mousemove", this.boundMouseMove);
+    this.canvas.addEventListener("mouseup", this.boundMouseUp);
+    this.canvas.addEventListener("mouseleave", this.boundMouseUp);
+  }
 
-  PreviewModal.prototype.handleBackdropClick = function handleBackdropClick(event) {
+  private handleBackdropClick(event: MouseEvent): void {
     if (event.target === this.modal) this.close();
-  };
+  }
 
-  PreviewModal.prototype.handleKeyDown = function handleKeyDown(event) {
+  private handleKeyDown(event: KeyboardEvent): void {
     if (event.key === "Escape" && this.isOpen) this.close();
-  };
+  }
 
-  PreviewModal.prototype.open = function open(sourceCanvas) {
+  open(sourceCanvas: HTMLCanvasElement): void {
     if (!(sourceCanvas instanceof HTMLCanvasElement)) {
       throw new TypeError("PreviewModal.open(sourceCanvas) expects an HTMLCanvasElement.");
     }
     this.imageWidth = sourceCanvas.width;
     this.imageHeight = sourceCanvas.height;
     if (!this.imageWidth || !this.imageHeight) throw new Error("Source canvas is empty.");
-    this.containerWidth = global.innerWidth;
-    this.containerHeight = global.innerHeight;
-    var fill = Number(this.options.initialViewportFill);
-    if (!Number.isFinite(fill) || fill <= 0 || fill > 1) fill = DEFAULTS.initialViewportFill;
-    var targetWidth = this.containerWidth * fill;
-    var targetHeight = this.containerHeight * fill;
-    var scaleX = targetWidth / this.imageWidth;
-    var scaleY = targetHeight / this.imageHeight;
+    this.containerWidth = window.innerWidth;
+    this.containerHeight = window.innerHeight;
+    let fill = Number(this.options.initialViewportFill);
+    if (!Number.isFinite(fill) || fill <= 0 || fill > 1) fill = PREVIEW_MODAL_DEFAULTS.initialViewportFill;
+    const targetWidth = this.containerWidth * fill;
+    const targetHeight = this.containerHeight * fill;
+    const scaleX = targetWidth / this.imageWidth;
+    const scaleY = targetHeight / this.imageHeight;
     this.scale = clamp(Math.min(scaleX, scaleY), this.minScale, this.maxScale);
     this.offsetX = (this.containerWidth - this.imageWidth * this.scale) / 2;
     this.offsetY = (this.containerHeight - this.imageHeight * this.scale) / 2;
@@ -145,9 +430,9 @@
     this.isOpen = true;
     this.notifyShell(true);
     this.render();
-  };
+  }
 
-  PreviewModal.prototype.update = function update(sourceCanvas) {
+  update(sourceCanvas: HTMLCanvasElement): void {
     if (!this.isOpen) return;
     if (!(sourceCanvas instanceof HTMLCanvasElement)) return;
     if (sourceCanvas.width !== this.imageWidth || sourceCanvas.height !== this.imageHeight) {
@@ -156,35 +441,37 @@
     }
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
     this.ctx.drawImage(sourceCanvas, 0, 0);
-  };
+  }
 
-  PreviewModal.prototype.close = function close() {
+  close(): void {
+    const wasOpen = this.isOpen;
     this.modal.style.display = "none";
     this.isOpen = false;
     this.isDragging = false;
     this.hasDragged = false;
     this.notifyShell(false);
-  };
+    if (wasOpen) this.onClosed?.();
+  }
 
-  PreviewModal.prototype.zoomAt = function zoomAt(mouseX, mouseY, factor) {
-    var newScale = this.scale * factor;
+  private zoomAt(mouseX: number, mouseY: number, factor: number): void {
+    const newScale = this.scale * factor;
     if (newScale < this.minScale || newScale > this.maxScale) return;
-    var canvasX = (mouseX - this.offsetX) / this.scale;
-    var canvasY = (mouseY - this.offsetY) / this.scale;
+    const canvasX = (mouseX - this.offsetX) / this.scale;
+    const canvasY = (mouseY - this.offsetY) / this.scale;
     this.scale = newScale;
     this.offsetX = mouseX - canvasX * this.scale;
     this.offsetY = mouseY - canvasY * this.scale;
     this.constrainOffset();
     this.render();
-  };
+  }
 
-  PreviewModal.prototype.handleWheel = function handleWheel(event) {
+  private handleWheel(event: WheelEvent): void {
     event.preventDefault();
-    var delta = event.deltaY > 0 ? 0.9 : 1.1;
+    const delta = event.deltaY > 0 ? 0.9 : 1.1;
     this.zoomAt(event.clientX, event.clientY, delta);
-  };
+  }
 
-  PreviewModal.prototype.handleMouseDown = function handleMouseDown(event) {
+  private handleMouseDown(event: MouseEvent): void {
     if (event.button !== 0) return;
     this.isDragging = true;
     this.hasDragged = false;
@@ -193,14 +480,14 @@
     this.lastX = event.clientX;
     this.lastY = event.clientY;
     this.canvas.style.cursor = "grabbing";
-  };
+  }
 
-  PreviewModal.prototype.handleMouseMove = function handleMouseMove(event) {
+  private handleMouseMove(event: MouseEvent): void {
     if (!this.isDragging) return;
-    var deltaX = event.clientX - this.lastX;
-    var deltaY = event.clientY - this.lastY;
-    var totalDx = event.clientX - this.dragStartX;
-    var totalDy = event.clientY - this.dragStartY;
+    const deltaX = event.clientX - this.lastX;
+    const deltaY = event.clientY - this.lastY;
+    const totalDx = event.clientX - this.dragStartX;
+    const totalDy = event.clientY - this.dragStartY;
     if (!this.hasDragged && (Math.abs(totalDx) > 3 || Math.abs(totalDy) > 3)) this.hasDragged = true;
     if (this.hasDragged) {
       this.offsetX += deltaX;
@@ -210,80 +497,91 @@
     }
     this.lastX = event.clientX;
     this.lastY = event.clientY;
-  };
+  }
 
-  PreviewModal.prototype.handleMouseUp = function handleMouseUp(event) {
+  private handleMouseUp(event: MouseEvent): void {
     if (!this.isDragging) return;
     if (!this.hasDragged) this.zoomAt(event.clientX, event.clientY, 1.5);
     this.isDragging = false;
     this.canvas.style.cursor = "grab";
-  };
+  }
 
-  PreviewModal.prototype.constrainOffset = function constrainOffset() {
-    var scaledWidth = this.imageWidth * this.scale;
-    var scaledHeight = this.imageHeight * this.scale;
-    var minOffsetX = this.containerWidth - scaledWidth;
-    var maxOffsetX = 0;
-    var minOffsetY = this.containerHeight - scaledHeight;
-    var maxOffsetY = 0;
+  private constrainOffset(): void {
+    const scaledWidth = this.imageWidth * this.scale;
+    const scaledHeight = this.imageHeight * this.scale;
+    const minOffsetX = this.containerWidth - scaledWidth;
+    const maxOffsetX = 0;
+    const minOffsetY = this.containerHeight - scaledHeight;
+    const maxOffsetY = 0;
     if (scaledWidth < this.containerWidth) this.offsetX = (this.containerWidth - scaledWidth) / 2;
     else this.offsetX = Math.max(minOffsetX, Math.min(maxOffsetX, this.offsetX));
     if (scaledHeight < this.containerHeight) this.offsetY = (this.containerHeight - scaledHeight) / 2;
     else this.offsetY = Math.max(minOffsetY, Math.min(maxOffsetY, this.offsetY));
-  };
+  }
 
-  PreviewModal.prototype.render = function render() {
+  private render(): void {
     if (!this.isOpen) return;
-    var scaledWidth = this.imageWidth * this.scale;
-    var scaledHeight = this.imageHeight * this.scale;
-    this.canvas.style.width = scaledWidth + "px";
-    this.canvas.style.height = scaledHeight + "px";
-    this.canvas.style.left = this.offsetX + "px";
-    this.canvas.style.top = this.offsetY + "px";
-    this.zoomLevel.textContent = Math.round(this.scale * 100) + "%";
-  };
+    const scaledWidth = this.imageWidth * this.scale;
+    const scaledHeight = this.imageHeight * this.scale;
+    this.canvas.style.width = `${scaledWidth}px`;
+    this.canvas.style.height = `${scaledHeight}px`;
+    this.canvas.style.left = `${this.offsetX}px`;
+    this.canvas.style.top = `${this.offsetY}px`;
+    this.zoomLevel.textContent = `${Math.round(this.scale * 100)}%`;
+  }
+}
 
-  global.PreviewModal = PreviewModal;
-})(window);
-
-let allImages = [];
-let visibleImages = [];
-let allTagPool = [];
-let allTagMeta = new Map();
-let tabs = [];
-let activeTabId = null;
+let allImages: ImageItem[] = [];
+let visibleImages: ImageItem[] = [];
+let allTagPool: string[] = [];
+let allTagMeta: Map<string, TagMeta> = new Map();
+let scannedRoots: string[] = [];
+let folderTreeItems: FolderTreeItem[] = [];
+let tabs: GalleryTab[] = [];
+let activeTabId: string | null = null;
 let lbIndex = -1;
-let statusInterval = null;
-let loadedIds = new Set();
-let observer = null;
-let sessionSaveTimer = null;
+let statusInterval: ReturnType<typeof setInterval> | null = null;
+let loadedIds = new Set<string>();
+let observer: IntersectionObserver | null = null;
+let sessionSaveTimer: ReturnType<typeof setTimeout> | null = null;
 let renderedCount = 0;
 let serverTotal = 0;
-let nextCursor = null;
+let serverTotalKnown = false;
+let nextCursor: string | null = null;
 let hasMorePages = false;
 let isLoadingPage = false;
 let activeImagesRequest = 0;
-let previewModal = null;
-let lightboxImages = [];
+let masonryColumns: HTMLElement[] = [];
+let masonryHeights: number[] = [];
+let masonryColumnCount = 0;
+let previewModal: PreviewModal | null = null;
+let lightboxImages: ImageItem[] = [];
 let previewRequestToken = 0;
 let suppressPreviewCloseClear = false;
-let tagManagerSelection = {includeTags: [], excludeTags: []};
-let latestStatus = null;
+let tagManagerSelection: Pick<GalleryTab, 'includeTags' | 'excludeTags'> = {includeTags: [], excludeTags: []};
+let latestStatus: StatusResponse | null = null;
 let filterSuggestionOpen = false;
-let settingsActiveTab = 'general';
-let tagAdminSort = 'name';
+let settingsActiveTab: SettingsTab = 'general';
+let tagAdminSort: TagAdminSort = 'name';
 let lastScrollY = 0;
-let graphState = null;
+let graphState: GraphState | null = null;
 const PAGE = 48;
-const canvasCache = new Map();
+const MASONRY_COL_MIN = 230;
+const canvasCache = new Map<string, Promise<HTMLCanvasElement>>();
 const MAX_CANVAS_CACHE = 9;
+const SORT_MODES: SortMode[] = ['path_asc', 'path_desc', 'date_desc', 'date_asc', 'size_desc', 'size_asc'];
+const DEFAULT_SORT_MODE: SortMode = 'date_desc';
 
-function makeDefaultTab(title) {
-  const id = "tab-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 7);
-  return { id, title: title || "Все фото", includeTags: [], excludeTags: [], matchMode: "any", lastImageId: null, scrollTop: 0 };
+function isSortMode(mode: string | undefined): mode is SortMode {
+  return Boolean(mode && SORT_MODES.includes(mode as SortMode));
 }
 
-function activeTab() {
+function makeDefaultTab(title = "Все фото"): GalleryTab {
+  const id = "tab-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 7);
+  return { id, title, includeTags: [], excludeTags: [], matchMode: "any", sortMode: DEFAULT_SORT_MODE, lastImageId: null, scrollTop: 0 };
+}
+
+function activeTab(): GalleryTab {
   if (!tabs.length) {
     const tab = makeDefaultTab();
     tabs = [tab];
@@ -297,14 +595,30 @@ function activeTab() {
   tab.includeTags = Array.isArray(tab.includeTags) ? tab.includeTags : [];
   tab.excludeTags = Array.isArray(tab.excludeTags) ? tab.excludeTags : [];
   tab.matchMode = tab.matchMode === "all" ? "all" : "any";
+  tab.sortMode = SORT_MODES.includes(tab.sortMode) ? tab.sortMode : DEFAULT_SORT_MODE;
   return tab;
 }
 
-async function openFolder() {
-  const setupInput = document.getElementById('setup-folder');
-  const folderInput = document.getElementById('folder-input');
-  const setupVisible = document.getElementById('setup-screen').style.display !== 'none';
-  const p = (setupVisible ? setupInput.value : (folderInput.value || setupInput.value)).trim();
+function setFolderInputValues(path: string): void {
+  ['setup-folder', 'folder-input'].forEach(id => {
+    const input = optionalInput(id);
+    if (input) input.value = path || '';
+  });
+}
+
+function getFolderInputValue(): string {
+  const setupInput = optionalInput('setup-folder');
+  const folderInput = optionalInput('folder-input');
+  return String((folderInput && folderInput.value) || (setupInput && setupInput.value) || '').trim();
+}
+
+function promptFolderPath(message: string): string {
+  const typed = window.prompt(`${message}\n\nВведите путь к папке вручную:`);
+  return String(typed || '').trim();
+}
+
+async function openFolder(pathOverride = '') {
+  const p = String(pathOverride || getFolderInputValue()).trim();
   if (!p) return alert('Введите путь к папке');
   try {
     const r = await fetch('/api/folder', {
@@ -313,87 +627,232 @@ async function openFolder() {
       body: JSON.stringify({path: p})
     });
     if (!r.ok) throw new Error(await readError(r));
-    folderInput.value = p;
-    setupInput.value = p;
-    tabs = [makeDefaultTab()];
-    activeTabId = tabs[0].id;
+    const data = await readJsonRecord(r);
+    setFolderInputValues(p);
+    if (Array.isArray(data.root_paths)) scannedRoots = stringArray(data.root_paths);
     showGallery();
     renderTabs();
     renderFilterControls();
     startStatusPolling();
     await refreshImages(true);
+    await refreshFolderTree();
     saveSessionSoon();
   } catch (e) {
-    alert('Ошибка: ' + e.message);
+    alert('Ошибка: ' + errorMessage(e));
   }
 }
 
-function toggleSettings(force) {
-  const panel = document.getElementById('settings-panel');
+async function pickFolder() {
+  try {
+    const r = await fetch('/api/folder/pick', {method: 'POST'});
+    if (!r.ok) {
+      const manualPath = promptFolderPath(await readError(r));
+      if (manualPath) await openFolder(manualPath);
+      return;
+    }
+    const data = await readJsonRecord(r);
+    if (data.manual) {
+      const manualPath = promptFolderPath(String(data.message || 'Нативный выбор папки недоступен.'));
+      if (manualPath) await openFolder(manualPath);
+      return;
+    }
+    if (data.cancelled || !data.path) return;
+    const path = String(data.path);
+    setFolderInputValues(path);
+    await openFolder(path);
+  } catch (e) {
+    const manualPath = promptFolderPath('Не удалось открыть выбор папки: ' + errorMessage(e));
+    if (manualPath) await openFolder(manualPath);
+  }
+}
+
+async function refreshFolderTree() {
+  try {
+    const r = await fetch('/api/folders');
+    if (!r.ok) return;
+    const data = await readJsonRecord(r);
+    const roots = stringArray(data.roots);
+    if (roots.length) scannedRoots = roots;
+    folderTreeItems = Array.isArray(data.items)
+      ? data.items.filter(isRecord).map(item => ({
+        root_path: String(item.root_path || ''),
+        path: String(item.path || '')
+      })).filter(item => item.root_path && item.path)
+      : [];
+    renderFolderTree();
+    updateRootSummary();
+  } catch {}
+}
+
+function toggleFolderSidebar(force?: boolean): void {
+  const sidebar = optionalHtml('folder-sidebar');
+  if (!sidebar) return;
+  const open = force === undefined ? sidebar.classList.contains('collapsed') : Boolean(force);
+  sidebar.classList.toggle('collapsed', !open);
+}
+
+function updateRootSummary(): void {
+  const current = optionalHtml('current-root');
+  if (!current) return;
+  current.title = '';
+  if (!scannedRoots.length) {
+    current.textContent = 'Папка не выбрана';
+  } else if (scannedRoots.length === 1) {
+    current.textContent = scannedRoots[0];
+  } else {
+    current.textContent = `${scannedRoots.length} папки`;
+    current.title = scannedRoots.join('\n');
+  }
+}
+
+function pathName(path: string): string {
+  const parts = String(path || '').split(/[\\/]+/).filter(Boolean);
+  return parts[parts.length - 1] || path || 'Папка';
+}
+
+function makeFolderNode(name: string): FolderNode {
+  return {name, children: new Map()};
+}
+
+function buildFolderTree(): Map<string, FolderNode> {
+  const roots = new Map<string, FolderNode>();
+  scannedRoots.forEach(root => roots.set(root, makeFolderNode(pathName(root))));
+  folderTreeItems.forEach(item => {
+    const root = item.root_path;
+    if (!roots.has(root)) roots.set(root, makeFolderNode(pathName(root)));
+    const relParts = String(item.path || '').split(/[\\/]+/).filter(Boolean).slice(0, -1);
+    const rootNode = roots.get(root);
+    if (!rootNode) return;
+    let node: FolderNode = rootNode;
+    relParts.forEach(part => {
+      let child = node.children.get(part);
+      if (!child) {
+        child = makeFolderNode(part);
+        node.children.set(part, child);
+      }
+      node = child;
+    });
+  });
+  return roots;
+}
+
+function renderFolderNode(node: FolderNode, depth = 0): string {
+  const childNodes = Array.from(node.children.values());
+  const hasChildren = childNodes.length > 0;
+  const children = hasChildren
+    ? `<div class="folder-children">${childNodes.map(child => renderFolderNode(child, depth + 1)).join('')}</div>`
+    : '';
+  return `
+    <div class="folder-node ${hasChildren ? '' : 'leaf'}" data-depth="${depth}">
+      <div class="folder-row" title="${escAttr(node.name)}">
+        <span class="folder-twist">${hasChildren ? '›' : ''}</span>
+        <span class="folder-name">${escHtml(node.name)}</span>
+      </div>
+      ${children}
+    </div>
+  `;
+}
+
+function renderFolderTree(): void {
+  const el = optionalHtml('folder-tree');
+  if (!el) return;
+  const roots = Array.from(buildFolderTree().values());
+  el.innerHTML = roots.length
+    ? roots.map(root => renderFolderNode(root)).join('')
+    : '<div class="folder-empty">Папки не добавлены</div>';
+  el.querySelectorAll<HTMLElement>('.folder-node:not(.leaf) > .folder-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const node = row.parentElement;
+      if (!node) return;
+      node.classList.toggle('collapsed');
+      const twist = row.querySelector('.folder-twist');
+      if (twist) twist.textContent = node.classList.contains('collapsed') ? '›' : '⌄';
+    });
+    const twist = row.querySelector('.folder-twist');
+    if (twist) twist.textContent = '⌄';
+  });
+}
+
+function toggleSettings(force?: boolean): void {
+  const panel = requiredHtml('settings-panel');
   const open = force === undefined ? !panel.classList.contains('open') : Boolean(force);
   panel.classList.toggle('open', open);
   panel.setAttribute('aria-hidden', open ? 'false' : 'true');
   if (open) document.body.classList.add('modal-open');
-  else if (!document.getElementById('graph-overlay').classList.contains('open')) document.body.classList.remove('modal-open');
+  else if (!requiredHtml('graph-overlay').classList.contains('open')) document.body.classList.remove('modal-open');
   if (open) {
     showChrome();
     setSettingsTab(settingsActiveTab || 'general');
   }
 }
 
-function setSettingsTab(tab) {
-  settingsActiveTab = ['general', 'tags', 'graph'].includes(tab) ? tab : 'general';
-  document.querySelectorAll('.settings-tab').forEach(btn => {
+function setSettingsTab(tab: SettingsTab | string | undefined): void {
+  settingsActiveTab = tab === 'tags' || tab === 'graph' || tab === 'general' ? tab : 'general';
+  document.querySelectorAll<HTMLElement>('.settings-tab').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.settingsTab === settingsActiveTab);
   });
-  document.querySelectorAll('.settings-panel-page').forEach(panel => {
+  document.querySelectorAll<HTMLElement>('.settings-panel-page').forEach(panel => {
     panel.classList.toggle('active', panel.dataset.settingsPanel === settingsActiveTab);
   });
   if (settingsActiveTab === 'tags') renderTagAdmin();
 }
 
-function showGallery() {
-  document.getElementById('setup-screen').style.display = 'none';
-  document.getElementById('gallery-screen').style.display = 'block';
+function showGallery(): void {
+  requiredHtml('setup-screen').style.display = 'none';
+  requiredHtml('gallery-screen').style.display = 'block';
 }
 
-function showSetup() {
-  document.getElementById('setup-screen').style.display = 'flex';
-  document.getElementById('gallery-screen').style.display = 'none';
+function showSetup(): void {
+  requiredHtml('setup-screen').style.display = 'none';
+  requiredHtml('gallery-screen').style.display = 'block';
+  toggleFolderSidebar(true);
+  renderFolderTree();
+  updateRootSummary();
 }
 
-document.getElementById('setup-folder').addEventListener('keydown', e => {
+const setupFolderInput = optionalInput('setup-folder');
+if (setupFolderInput) setupFolderInput.addEventListener('keydown', e => {
   if (e.key === 'Enter') openFolder();
 });
-document.getElementById('folder-input').addEventListener('keydown', e => {
+const settingsFolderInput = optionalInput('folder-input');
+if (settingsFolderInput) settingsFolderInput.addEventListener('keydown', e => {
   if (e.key === 'Enter') openFolder();
 });
 
-async function startStatusPolling() {
+async function startStatusPolling(): Promise<void> {
   if (statusInterval) clearInterval(statusInterval);
   await pollStatus();
   statusInterval = setInterval(pollStatus, 1000);
 }
 
-async function pollStatus() {
+async function pollStatus(): Promise<void> {
   try {
-    const s = await fetch('/api/status').then(r => r.json());
+    const r = await fetch('/api/status');
+    const s = statusResponse(await readJsonRecord(r));
     latestStatus = s;
     renderDbStatus(s);
-    if (s.root) {
-      document.getElementById('folder-input').value = s.root;
-      document.getElementById('setup-folder').value = s.root;
-      document.getElementById('current-root').textContent = s.root;
+    if (Array.isArray(s.root_paths) && s.root_paths.length) {
+      scannedRoots = stringArray(s.root_paths);
+      updateRootSummary();
+      renderFolderTree();
+    } else if (s.root && !scannedRoots.includes(s.root)) {
+      scannedRoots = [...scannedRoots, s.root];
+      updateRootSummary();
+      renderFolderTree();
     }
-    const prog = document.getElementById('scan-progress');
-    const bar = document.getElementById('scan-bar');
-    const txt = document.getElementById('status-text');
+    if (s.root) setFolderInputValues(s.root);
+    const prog = optionalHtml('scan-progress');
+    const bar = optionalHtml('scan-bar');
+    const txt = optionalHtml('status-text');
+    if (!prog || !bar || !txt) return;
     if (s.running) {
       prog.style.display = 'block';
-      const pct = s.total > 0 ? Math.round(s.done / s.total * 100) : 0;
+      const total = Number(s.total || 0);
+      const done = Number(s.done || 0);
+      const pct = total > 0 ? Math.round(done / total * 100) : 0;
       bar.style.width = pct + '%';
-      txt.textContent = `Сканирование: ${s.done}/${s.total}`;
-      if (s.done % 20 === 0 || s.done === s.total) refreshImages(false);
+      txt.textContent = `Сканирование: ${done}/${total}`;
+      if (done % 20 === 0 || done === total) refreshImages(false);
     } else if (s.queued) {
       prog.style.display = 'block';
       bar.style.width = '0';
@@ -402,25 +861,28 @@ async function pollStatus() {
       prog.style.display = 'none';
       bar.style.width = '0';
       txt.textContent = s.error ? s.error : (s.root || 'Готово');
-      if (s.root) refreshImages(false);
+      if (s.root) {
+        refreshImages(false);
+        refreshFolderTree();
+      }
       if (statusInterval && !s.error && !s.queued) {
         clearInterval(statusInterval);
         statusInterval = null;
       }
     }
   } catch (e) {
-    setDbStatus(false, e.message);
+    setDbStatus(false, errorMessage(e));
   }
 }
 
-function renderDbStatus(status) {
+function renderDbStatus(status: StatusResponse): void {
   if (status.db_ready) setDbStatus(true, 'PostgreSQL подключен');
   else setDbStatus(false, status.db_error || 'PostgreSQL недоступен');
 }
 
-function setDbStatus(ok, text) {
-  const db = document.getElementById('db-status');
-  const setup = document.getElementById('setup-db-status');
+function setDbStatus(ok: boolean, text: string): void {
+  const db = requiredHtml('db-status');
+  const setup = requiredHtml('setup-db-status');
   db.textContent = text;
   db.title = text;
   setup.textContent = text;
@@ -429,7 +891,30 @@ function setDbStatus(ok, text) {
   db.classList.toggle('bad', !ok);
 }
 
-async function refreshImages(clear = true) {
+function pageTotalValue(page: ImagePage | null | undefined): number | null {
+  if (!page || page.total === null || page.total === undefined || page.total === '') return null;
+  const total = Number(page.total);
+  return Number.isFinite(total) ? total : null;
+}
+
+function setServerTotalFromPage(page: ImagePage | null | undefined, fallbackCount: number, resetKnown: boolean): void {
+  const total = pageTotalValue(page);
+  if (total !== null) {
+    serverTotalKnown = true;
+    serverTotal = total;
+    return;
+  }
+  if (resetKnown) serverTotalKnown = false;
+  if (!serverTotalKnown) serverTotal = Number(fallbackCount || 0);
+}
+
+function updateImageCounter(): void {
+  const count = serverTotalKnown ? serverTotal : visibleImages.length;
+  const suffix = !serverTotalKnown && hasMorePages ? '+' : '';
+  requiredHtml('count-text').textContent = `${count}${suffix} фото`;
+}
+
+async function refreshImages(clear = true): Promise<void> {
   const requestId = ++activeImagesRequest;
   const tab = activeTab();
   const params = new URLSearchParams();
@@ -437,47 +922,48 @@ async function refreshImages(clear = true) {
   if (tab.excludeTags && tab.excludeTags.length) params.set('exclude_tags', tab.excludeTags.join(','));
   params.set('match_mode', tab.matchMode === 'all' ? 'all' : 'any');
   params.set('limit', String(PAGE));
-  params.set('sort', 'path_asc');
-  params.set('include_total', '0');
+  params.set('sort', tab.sortMode || DEFAULT_SORT_MODE);
+  params.set('include_total', '1');
   try {
     const r = await fetch('/api/images?' + params.toString());
     if (!r.ok) throw new Error(await readError(r));
-    const d = await r.json();
+    const d = await readJsonRecord(r);
     if (requestId !== activeImagesRequest) return;
-    allImages = d.items || d.images || [];
+    allImages = imagesFromRecord(d);
     visibleImages = allImages.slice();
-    serverTotal = Number((d.page && d.page.total) || visibleImages.length || 0);
-    nextCursor = d.page ? d.page.next_cursor : null;
-    hasMorePages = Boolean(d.page && d.page.has_more);
+    const page = imagePage(d.page);
+    setServerTotalFromPage(page, visibleImages.length, true);
+    nextCursor = page ? page.next_cursor || null : null;
+    hasMorePages = Boolean(page && page.has_more);
     isLoadingPage = false;
     await refreshTagPool();
     applyFilter(clear);
     restorePreviewIfNeeded();
   } catch (e) {
     console.error(e);
-    document.getElementById('status-text').textContent = e.message;
+    requiredHtml('status-text').textContent = errorMessage(e);
   }
 }
 
-function applyFilter(clear = true) {
+function applyFilter(clear = true): void {
   const tab = activeTab();
   visibleImages = allImages.slice();
-  const count = serverTotal || visibleImages.length;
-  document.getElementById('count-text').textContent = `${count}${hasMorePages ? '+' : ''} фото`;
+  updateImageCounter();
   updateTabTitle(tab);
   renderTabs();
   renderFilterControls();
   if (clear) {
     loadedIds.clear();
     renderedCount = 0;
-    document.getElementById('gallery').innerHTML = '';
+    requiredHtml('gallery').innerHTML = '';
+    resetMasonryLayout();
   }
   renderBatch();
-  document.getElementById('empty-state').style.display = visibleImages.length ? 'none' : 'flex';
+  requiredHtml('empty-state').style.display = visibleImages.length ? 'none' : 'flex';
   requestGraphRebuild();
 }
 
-async function loadNextImagesPage() {
+async function loadNextImagesPage(): Promise<void> {
   if (!hasMorePages || !nextCursor || isLoadingPage) return;
   isLoadingPage = true;
   const tab = activeTab();
@@ -486,22 +972,24 @@ async function loadNextImagesPage() {
   if (tab.excludeTags && tab.excludeTags.length) params.set('exclude_tags', tab.excludeTags.join(','));
   params.set('match_mode', tab.matchMode === 'all' ? 'all' : 'any');
   params.set('limit', String(PAGE));
-  params.set('sort', 'path_asc');
+  params.set('sort', tab.sortMode || DEFAULT_SORT_MODE);
   params.set('include_total', '0');
   params.set('cursor', nextCursor);
   try {
     const r = await fetch('/api/images?' + params.toString());
     if (!r.ok) throw new Error(await readError(r));
-    const d = await r.json();
-    const items = d.items || d.images || [];
+    const d = await readJsonRecord(r);
+    const items = imagesFromRecord(d);
     const seen = new Set(allImages.map(img => img.id));
     items.forEach(img => {
       if (!seen.has(img.id)) allImages.push(img);
     });
     visibleImages = allImages.slice();
-    serverTotal = Number((d.page && d.page.total) || serverTotal || visibleImages.length || 0);
-    nextCursor = d.page ? d.page.next_cursor : null;
-    hasMorePages = Boolean(d.page && d.page.has_more);
+    const page = imagePage(d.page);
+    setServerTotalFromPage(page, visibleImages.length, false);
+    nextCursor = page ? page.next_cursor || null : null;
+    hasMorePages = Boolean(page && page.has_more);
+    updateImageCounter();
     renderBatch();
   } catch (e) {
     console.error(e);
@@ -510,25 +998,25 @@ async function loadNextImagesPage() {
   }
 }
 
-function renderBatch() {
-  const gallery = document.getElementById('gallery');
+function renderBatch(): void {
+  ensureMasonryLayout(false);
   const start = renderedCount;
   const end = Math.min(start + PAGE, visibleImages.length);
   for (let i = start; i < end; i++) {
     const img = visibleImages[i];
     if (loadedIds.has(img.id)) continue;
     loadedIds.add(img.id);
-    gallery.appendChild(makeCard(img, i));
+    placeMasonryCard(makeCard(img, i), img);
   }
   renderedCount = end;
   setupLazyLoad();
 }
 
-function makeCard(img, idx) {
+function makeCard(img: ImageItem, idx: number): HTMLElement {
   const card = document.createElement('article');
   card.className = 'card';
   card.dataset.id = img.id;
-  card.dataset.idx = idx;
+  card.dataset.idx = String(idx);
   const name = fileName(img.path);
   const ph = document.createElement('img');
   ph.className = 'lazy';
@@ -538,9 +1026,11 @@ function makeCard(img, idx) {
   ph.decoding = 'async';
   ph.loading = 'lazy';
   ph.style.aspectRatio = aspectCss(img);
-  if (img.width > 0 && img.height > 0) {
-    ph.width = img.width;
-    ph.height = img.height;
+  const width = Number(img.width || 0);
+  const height = Number(img.height || 0);
+  if (width > 0 && height > 0) {
+    ph.width = width;
+    ph.height = height;
   }
   const overlay = document.createElement('div');
   overlay.className = 'card-overlay';
@@ -554,7 +1044,7 @@ function makeCard(img, idx) {
   return card;
 }
 
-function renderTagChips(img) {
+function renderTagChips(img: ImageItem): string {
   const autoTags = img.auto_tags || img.folder_tags || [];
   const userTags = img.user_tags || [];
   return [
@@ -563,19 +1053,20 @@ function renderTagChips(img) {
   ].join('');
 }
 
-function updateCardForImage(img) {
+function updateCardForImage(img: ImageItem): void {
   const card = document.querySelector(`.card[data-id="${cssEscape(img.id)}"]`);
   if (!card) return;
   const tags = card.querySelector('.card-tags');
   if (tags) tags.innerHTML = renderTagChips(img);
 }
 
-function setupLazyLoad() {
+function setupLazyLoad(): void {
   if (observer) observer.disconnect();
-  observer = new IntersectionObserver(entries => {
+  const lazyObserver = new IntersectionObserver(entries => {
     entries.forEach(entry => {
       if (!entry.isIntersecting) return;
       const img = entry.target;
+      if (!(img instanceof HTMLImageElement)) return;
       if (img.dataset.src) {
         img.onload = () => img.classList.add('loaded');
         img.onerror = () => {
@@ -589,19 +1080,20 @@ function setupLazyLoad() {
         };
         img.src = img.dataset.src;
         img.removeAttribute('data-src');
-        observer.unobserve(img);
+        lazyObserver.unobserve(img);
       }
     });
   }, {rootMargin: '320px'});
-  document.querySelectorAll('img.lazy').forEach(img => observer.observe(img));
-  const gallery = document.getElementById('gallery');
-  const old = gallery.querySelector('.sentinel');
+  observer = lazyObserver;
+  document.querySelectorAll<HTMLImageElement>('img.lazy').forEach(img => lazyObserver.observe(img));
+  const galleryWrap = requiredHtml('gallery-wrap');
+  const old = galleryWrap.querySelector('.sentinel');
   if (old) old.remove();
   if (renderedCount < visibleImages.length) {
     const sentinel = document.createElement('div');
     sentinel.className = 'sentinel';
     sentinel.style.height = '1px';
-    gallery.appendChild(sentinel);
+    galleryWrap.appendChild(sentinel);
     const sentinelObs = new IntersectionObserver(entries => {
       if (entries[0].isIntersecting) {
         sentinelObs.disconnect();
@@ -617,7 +1109,7 @@ function setupLazyLoad() {
     const sentinel = document.createElement('div');
     sentinel.className = 'sentinel';
     sentinel.style.height = '1px';
-    gallery.appendChild(sentinel);
+    galleryWrap.appendChild(sentinel);
     const sentinelObs = new IntersectionObserver(entries => {
       if (entries[0].isIntersecting) {
         sentinelObs.disconnect();
@@ -628,7 +1120,7 @@ function setupLazyLoad() {
   }
 }
 
-async function loadThumbWithRetry(img, url, attempt = 0) {
+async function loadThumbWithRetry(img: HTMLImageElement, url: string, attempt = 0): Promise<void> {
   const maxAttempts = 20;
   try {
     const r = await fetch(url, {cache: 'no-store'});
@@ -644,7 +1136,7 @@ async function loadThumbWithRetry(img, url, attempt = 0) {
     if (r.status === 202 && attempt < maxAttempts) {
       let retryAfter = 180;
       try {
-        const p = await r.json();
+        const p = await readJsonRecord(r);
         retryAfter = Math.max(80, Number(p.retry_after_ms || retryAfter));
       } catch {}
       setTimeout(() => loadThumbWithRetry(img, url, attempt + 1), retryAfter);
@@ -657,7 +1149,9 @@ async function loadThumbWithRetry(img, url, attempt = 0) {
 
 async function refreshTagPool() {
   try {
-    const d = await fetch('/api/tags').then(r => r.json());
+    const r = await fetch('/api/tags');
+    if (!r.ok) throw new Error(await readError(r));
+    const d = await readJsonRecord(r);
     setTagPool(d.tags || []);
     updateFishGhosts();
     renderFilterSuggestions();
@@ -676,7 +1170,7 @@ function addTab() {
   saveSessionSoon();
 }
 
-function switchTab(id) {
+function switchTab(id: string): void {
   if (id === activeTabId) return;
   saveActiveScroll();
   activeTabId = id;
@@ -687,7 +1181,7 @@ function switchTab(id) {
   saveSessionSoon();
 }
 
-function closeTab(id) {
+function closeTab(id: string): void {
   if (tabs.length <= 1) {
     tabs = [makeDefaultTab()];
     activeTabId = tabs[0].id;
@@ -704,63 +1198,74 @@ function closeTab(id) {
   saveSessionSoon();
 }
 
-function renderTabs() {
-  const el = document.getElementById('tabs');
+function renderTabs(): void {
+  const el = requiredHtml('tabs');
   el.innerHTML = tabs.map(tab => `
     <button class="tab ${tab.id === activeTabId ? 'active' : ''}" data-tab="${escAttr(tab.id)}" title="${escAttr(tab.title)}">
       <span class="tab-title">${escHtml(tab.title)}</span>
       <span class="tab-close" data-close="${escAttr(tab.id)}">×</span>
     </button>
   `).join('');
-  el.querySelectorAll('.tab[data-tab]').forEach(btn => {
+  el.querySelectorAll<HTMLElement>('.tab[data-tab]').forEach(btn => {
     btn.addEventListener('click', e => {
-      if (e.target.closest('.tab-close')) return;
-      switchTab(btn.dataset.tab);
+      if (closestFromEvent(e, '.tab-close')) return;
+      const id = btn.dataset.tab;
+      if (id) switchTab(id);
     });
   });
-  el.querySelectorAll('.tab-close[data-close]').forEach(btn => {
+  el.querySelectorAll<HTMLElement>('.tab-close[data-close]').forEach(btn => {
     btn.addEventListener('click', e => {
       e.stopPropagation();
-      closeTab(btn.dataset.close);
+      const id = btn.dataset.close;
+      if (id) closeTab(id);
     });
   });
 }
 
-function updateTabTitle(tab) {
+function updateTabTitle(tab: GalleryTab): void {
   const include = tab.includeTags || [];
   const exclude = tab.excludeTags || [];
   if (!include.length && !exclude.length) {
     tab.title = "Все фото";
     return;
   }
-  const parts = [];
+  const parts: string[] = [];
   if (include.length) parts.push((tab.matchMode === "all" ? "все " : "любой ") + include.join(tab.matchMode === "all" ? " + " : " / "));
   if (exclude.length) parts.push("без " + exclude.join(", "));
   tab.title = parts.join(" / ").slice(0, 80);
 }
 
-function saveActiveScroll() {
+function saveActiveScroll(): void {
   if (!tabs.length) return;
   activeTab().scrollTop = window.scrollY || document.documentElement.scrollTop || 0;
 }
 
-function renderFilterControls() {
+function renderFilterControls(): void {
   const tab = activeTab();
-  document.getElementById('match-any').classList.toggle('active', tab.matchMode !== 'all');
-  document.getElementById('match-all').classList.toggle('active', tab.matchMode === 'all');
+  requiredHtml('match-any').classList.toggle('active', tab.matchMode !== 'all');
+  requiredHtml('match-all').classList.toggle('active', tab.matchMode === 'all');
+  const sortSelect = optionalElement('sort-select', HTMLSelectElement);
+  if (sortSelect) sortSelect.value = tab.sortMode || DEFAULT_SORT_MODE;
   renderSelectedFilterTags();
   renderFilterSuggestions();
 }
 
-function setMatchMode(mode) {
+function setMatchMode(mode: string | undefined): void {
   activeTab().matchMode = mode === 'all' ? 'all' : 'any';
   refreshImages(true);
   saveSessionSoon();
 }
 
-function renderSelectedFilterTags() {
+function setSortMode(mode: string | undefined): void {
+  activeTab().sortMode = isSortMode(mode) ? mode : DEFAULT_SORT_MODE;
+  refreshImages(true);
+  window.scrollTo({top: 0});
+  saveSessionSoon();
+}
+
+function renderSelectedFilterTags(): void {
   const tab = activeTab();
-  const el = document.getElementById('selected-filter-tags');
+  const el = requiredHtml('selected-filter-tags');
   const include = (tab.includeTags || []).map(tag => renderTagChip(tag, {
     removable: true,
     actionKind: 'include',
@@ -773,15 +1278,15 @@ function renderSelectedFilterTags() {
     className: 'filter-chip'
   })).join('');
   el.innerHTML = include + exclude || '<span class="muted-inline">Фильтры не выбраны</span>';
-  el.querySelectorAll('button[data-tag]').forEach(btn => {
+  el.querySelectorAll<HTMLElement>('button[data-tag]').forEach(btn => {
     btn.addEventListener('click', () => removeFilterTag(btn.dataset.kind, btn.dataset.tag));
   });
 }
 
-function parseFilterTagInput(raw) {
+function parseFilterTagInput(raw: string): {kind: TagKind; tag: string} | null {
   const parsed = splitTagPrefix(raw);
   let value = parsed.value;
-  let kind = 'include';
+  let kind: TagKind = 'include';
   if (parsed.prefix) {
     kind = 'exclude';
   }
@@ -789,13 +1294,14 @@ function parseFilterTagInput(raw) {
   return {kind, tag: findDisplayTag(value)};
 }
 
-function addFilterFromInput(raw) {
+function addFilterFromInput(raw: string): void {
   commitFilterTokens(raw);
 }
 
-function addFilterTag(kind, tag, clearInput = false) {
+function addFilterTag(kind: string | undefined, tag: string | undefined, clearInput = false): void {
+  if (!tag) return;
   const changed = applyFilterTagToTab(kind, tag, activeTab());
-  if (clearInput) document.getElementById('filter-tag-input').value = '';
+  if (clearInput) requiredInput('filter-tag-input').value = '';
   if (changed) {
     refreshImages(true);
     saveSessionSoon();
@@ -804,20 +1310,21 @@ function addFilterTag(kind, tag, clearInput = false) {
   }
 }
 
-function applyFilterTagToTab(kind, tag, tab) {
+function applyFilterTagToTab(kind: string | undefined, tag: string, tab: GalleryTab): boolean {
   const value = findDisplayTag(tag);
   if (!value) return false;
   const norm = normalizeTag(value);
-  const key = kind === 'exclude' ? 'excludeTags' : 'includeTags';
-  const oppositeKey = kind === 'exclude' ? 'includeTags' : 'excludeTags';
+  const normalizedKind = normalizeTagKind(kind);
+  const key: 'includeTags' | 'excludeTags' = normalizedKind === 'exclude' ? 'excludeTags' : 'includeTags';
+  const oppositeKey: 'includeTags' | 'excludeTags' = normalizedKind === 'exclude' ? 'includeTags' : 'excludeTags';
   const before = JSON.stringify([tab.includeTags || [], tab.excludeTags || []]);
   tab[oppositeKey] = (tab[oppositeKey] || []).filter(item => normalizeTag(item) !== norm);
   tab[key] = dedupeDisplayTags([...(tab[key] || []), value]);
   return before !== JSON.stringify([tab.includeTags || [], tab.excludeTags || []]);
 }
 
-function commitFilterTokens(raw) {
-  const input = document.getElementById('filter-tag-input');
+function commitFilterTokens(raw?: string): void {
+  const input = requiredInput('filter-tag-input');
   const tokens = String(raw || input.value || '').split(/\s+/).map(item => item.trim()).filter(Boolean);
   if (!tokens.length) return;
   let changed = false;
@@ -836,15 +1343,16 @@ function commitFilterTokens(raw) {
   }
 }
 
-function removeFilterTag(kind, tag) {
+function removeFilterTag(kind: string | undefined, tag: string | undefined): void {
+  if (!tag) return;
   const tab = activeTab();
-  const key = kind === 'exclude' ? 'excludeTags' : 'includeTags';
+  const key: 'includeTags' | 'excludeTags' = normalizeTagKind(kind) === 'exclude' ? 'excludeTags' : 'includeTags';
   tab[key] = (tab[key] || []).filter(item => normalizeTag(item) !== normalizeTag(tag));
   refreshImages(true);
   saveSessionSoon();
 }
 
-function clearActiveFilters() {
+function clearActiveFilters(): void {
   const tab = activeTab();
   tab.includeTags = [];
   tab.excludeTags = [];
@@ -852,16 +1360,16 @@ function clearActiveFilters() {
   saveSessionSoon();
 }
 
-function currentFilterPrefix() {
-  const input = document.getElementById('filter-tag-input');
+function currentFilterPrefix(): {token: string; prefix: string; query: string; kind: TagKind} {
+  const input = requiredInput('filter-tag-input');
   const token = String(input.value || '').split(/\s+/).pop() || '';
   const parsed = splitTagPrefix(token);
   return {token, prefix: parsed.prefix, query: normalizeTag(parsed.value), kind: parsed.prefix ? 'exclude' : 'include'};
 }
 
-function updateFilterGhost() {
-  const input = document.getElementById('filter-tag-input');
-  const ghost = document.getElementById('filter-tag-ghost');
+function updateFilterGhost(): void {
+  const input = requiredInput('filter-tag-input');
+  const ghost = requiredHtml('filter-tag-ghost');
   const raw = input.value || '';
   const parts = raw.split(/\s+/);
   const token = parts.pop() || '';
@@ -883,8 +1391,8 @@ function updateFilterGhost() {
     : '';
 }
 
-function renderFilterSuggestions() {
-  const list = document.getElementById('filter-suggestion-list');
+function renderFilterSuggestions(): void {
+  const list = optionalHtml('filter-suggestion-list');
   if (!list) return;
   updateFilterGhost();
   const {query, prefix, kind} = currentFilterPrefix();
@@ -907,16 +1415,16 @@ function renderFilterSuggestions() {
       return `<button class="filter-suggestion ${kind === 'exclude' ? 'is-exclude' : ''} ${activeKind ? 'active' : ''}" type="button" data-kind="${kind}" data-tag="${escAttr(tag)}">${escHtml(label)}${used.has(norm) ? ' ✓' : ''}</button>`;
     }).join('')
     : '<span class="muted-inline">Теги не найдены</span>';
-  list.querySelectorAll('button[data-tag]').forEach(btn => {
+  list.querySelectorAll<HTMLElement>('button[data-tag]').forEach(btn => {
     btn.addEventListener('click', () => {
       addFilterTag(btn.dataset.kind, btn.dataset.tag, true);
-      document.getElementById('filter-tag-input').focus();
+      requiredInput('filter-tag-input').focus();
     });
   });
 }
 
-function initFilterInput() {
-  const input = document.getElementById('filter-tag-input');
+function initFilterInput(): void {
+  const input = requiredInput('filter-tag-input');
   input.addEventListener('focus', () => {
     filterSuggestionOpen = true;
     renderFilterSuggestions();
@@ -953,25 +1461,25 @@ function initFilterInput() {
   });
 }
 
-function openTagManager() {
+function openTagManager(): void {
   const tab = activeTab();
   tagManagerSelection = {
     includeTags: [...(tab.includeTags || [])],
     excludeTags: [...(tab.excludeTags || [])]
   };
-  document.getElementById('tag-overlay').classList.add('open');
+  requiredHtml('tag-overlay').classList.add('open');
   toggleCreateTagPanel(false);
   renderTagManager();
 }
 
-function closeTagManager() {
-  document.getElementById('tag-overlay').classList.remove('open');
+function closeTagManager(): void {
+  requiredHtml('tag-overlay').classList.remove('open');
 }
 
-function renderTagManager() {
+function renderTagManager(): void {
   const selectedInclude = new Set((tagManagerSelection.includeTags || []).map(normalizeTag));
   const selectedExclude = new Set((tagManagerSelection.excludeTags || []).map(normalizeTag));
-  const selectedEl = document.getElementById('tag-manager-selected');
+  const selectedEl = requiredHtml('tag-manager-selected');
   selectedEl.innerHTML = [
     ...(tagManagerSelection.includeTags || []).map(tag => renderTagChip(tag, {
       removable: true,
@@ -985,36 +1493,39 @@ function renderTagManager() {
       className: 'filter-chip'
     }))
   ].join('') || '<span class="muted-inline">Выберите теги ниже</span>';
-  selectedEl.querySelectorAll('button[data-tag]').forEach(btn => {
+  selectedEl.querySelectorAll<HTMLElement>('button[data-tag]').forEach(btn => {
     btn.addEventListener('click', () => {
       removeManagerTag(btn.dataset.kind, btn.dataset.tag);
       renderTagManager();
     });
   });
-  const list = document.getElementById('tag-list');
-  list.innerHTML = `<button class="tag-option add" onclick="toggleCreateTagPanel(true)" title="Создать тег">+</button>` +
+  const list = requiredHtml('tag-list');
+  list.innerHTML = `<button class="tag-option add" data-action="toggle-create-tag-panel" data-open="true" title="Создать тег">+</button>` +
     allTagPool.map(tag => `
       <span class="tag-choice ${selectedInclude.has(normalizeTag(tag)) ? 'include' : ''} ${selectedExclude.has(normalizeTag(tag)) ? 'exclude' : ''}">
         <button class="tag-choice-name" data-kind="include" data-tag="${escAttr(tag)}">${renderTagChip(tag, {count: true})}</button>
         <button class="tag-choice-anti" data-kind="exclude" data-tag="${escAttr(tag)}">!</button>
       </span>
     `).join('');
-  list.querySelectorAll('.tag-choice button[data-tag]').forEach(btn => {
+  list.querySelectorAll<HTMLElement>('.tag-choice button[data-tag]').forEach(btn => {
     btn.addEventListener('click', () => toggleManagerTag(btn.dataset.kind, btn.dataset.tag));
   });
 }
 
-function removeManagerTag(kind, tag) {
+function removeManagerTag(kind: string | undefined, tag: string | undefined): void {
+  if (!tag) return;
   const norm = normalizeTag(tag);
-  const key = kind === 'exclude' ? 'excludeTags' : 'includeTags';
+  const key: 'includeTags' | 'excludeTags' = normalizeTagKind(kind) === 'exclude' ? 'excludeTags' : 'includeTags';
   tagManagerSelection[key] = (tagManagerSelection[key] || []).filter(item => normalizeTag(item) !== norm);
 }
 
-function toggleManagerTag(kind, tag) {
+function toggleManagerTag(kind: string | undefined, tag: string | undefined): void {
+  if (!tag) return;
   const value = findDisplayTag(tag);
   const norm = normalizeTag(value);
-  const key = kind === 'exclude' ? 'excludeTags' : 'includeTags';
-  const oppositeKey = kind === 'exclude' ? 'includeTags' : 'excludeTags';
+  const normalizedKind = normalizeTagKind(kind);
+  const key: 'includeTags' | 'excludeTags' = normalizedKind === 'exclude' ? 'excludeTags' : 'includeTags';
+  const oppositeKey: 'includeTags' | 'excludeTags' = normalizedKind === 'exclude' ? 'includeTags' : 'excludeTags';
   if ((tagManagerSelection[key] || []).some(item => normalizeTag(item) === norm)) {
     removeManagerTag(kind, value);
   } else {
@@ -1024,7 +1535,7 @@ function toggleManagerTag(kind, tag) {
   renderTagManager();
 }
 
-function applyTagManagerSelection() {
+function applyTagManagerSelection(): void {
   activeTab().includeTags = dedupeDisplayTags(tagManagerSelection.includeTags || []);
   activeTab().excludeTags = dedupeDisplayTags(tagManagerSelection.excludeTags || []);
   closeTagManager();
@@ -1032,18 +1543,18 @@ function applyTagManagerSelection() {
   saveSessionSoon();
 }
 
-function toggleCreateTagPanel(open) {
-  const panel = document.getElementById('tag-create-panel');
+function toggleCreateTagPanel(open?: boolean): void {
+  const panel = requiredHtml('tag-create-panel');
   panel.classList.toggle('open', Boolean(open));
   if (open) {
-    document.getElementById('tag-create-input').value = '';
+    requiredInput('tag-create-input').value = '';
     updateFishGhosts();
-    setTimeout(() => document.getElementById('tag-create-input').focus(), 0);
+    setTimeout(() => requiredInput('tag-create-input').focus(), 0);
   }
 }
 
-async function createTagFromManager() {
-  const input = document.getElementById('tag-create-input');
+async function createTagFromManager(): Promise<void> {
+  const input = requiredInput('tag-create-input');
   const value = input.value.trim();
   if (!value) return;
   try {
@@ -1053,7 +1564,7 @@ async function createTagFromManager() {
       body: JSON.stringify({name: value})
     });
     if (!r.ok) throw new Error(await readError(r));
-    const d = await r.json();
+    const d = await readJsonRecord(r);
     setTagPool(d.tags || [...allTagPool, d.tag || value]);
     const createdName = tagName(d.tag || value);
     tagManagerSelection.includeTags = dedupeDisplayTags([...(tagManagerSelection.includeTags || []), createdName]);
@@ -1064,23 +1575,23 @@ async function createTagFromManager() {
     renderTagAdmin();
     updateFishGhosts();
   } catch (e) {
-    alert('Ошибка: ' + e.message);
+    alert('Ошибка: ' + errorMessage(e));
   }
 }
 
-function renderAllTagSurfaces() {
+function renderAllTagSurfaces(): void {
   renderFilterControls();
-  if (document.getElementById('tag-overlay').classList.contains('open')) renderTagManager();
+  if (requiredHtml('tag-overlay').classList.contains('open')) renderTagManager();
   renderTagAdmin();
   visibleImages.forEach(updateCardForImage);
   const previewImage = (lightboxImages.length ? lightboxImages : visibleImages)[lbIndex];
   if (previewImage) renderPreviewTags(previewImage);
 }
 
-function renderTagAdmin() {
-  const list = document.getElementById('tag-admin-list');
+function renderTagAdmin(): void {
+  const list = optionalHtml('tag-admin-list');
   if (!list) return;
-  const query = normalizeTag(document.getElementById('tag-admin-search').value || '');
+  const query = normalizeTag(optionalInput('tag-admin-search')?.value || '');
   const tags = allTagPool
     .filter(tag => !query || normalizeTag(tag).includes(query))
     .sort((a, b) => {
@@ -1104,33 +1615,34 @@ function renderTagAdmin() {
         </div>
         <span class="tag-admin-counts">${Number(meta.image_count || 0)} фото · ${Number(meta.user_count || 0)} ручн · ${Number(meta.auto_count || 0)} папок</span>
         <button class="btn btn-ghost btn-sm" type="button" data-action="rename" data-tag="${escAttr(tag)}" ${isAuto ? 'disabled' : ''}>Сохранить</button>
-        <button class="btn btn-danger btn-sm" type="button" data-action="delete" data-tag="${escAttr(tag)}" ${isAuto ? 'disabled' : ''}>Удалить</button>
-        ${isAuto ? '<span class="tag-admin-protected">protected</span>' : '<span></span>'}
+        <button class="btn btn-danger btn-sm" type="button" data-action="delete" data-tag="${escAttr(tag)}">Удалить</button>
+        ${isAuto ? '<span class="tag-admin-protected">auto</span>' : '<span></span>'}
       </div>
     `;
   }).join('') : '<span class="muted-inline">Теги не найдены</span>';
 
-  list.querySelectorAll('input[data-action="color"]').forEach(input => {
+  list.querySelectorAll<HTMLInputElement>('input[data-action="color"]').forEach(input => {
     input.addEventListener('change', () => updateTagDefinition(input.dataset.tag, {color: input.value}, false));
   });
-  list.querySelectorAll('button[data-action="rename"]').forEach(btn => {
+  list.querySelectorAll<HTMLElement>('button[data-action="rename"]').forEach(btn => {
     btn.addEventListener('click', () => {
-      const input = btn.closest('.tag-admin-row').querySelector('.tag-admin-name-input');
+      const row = btn.closest('.tag-admin-row');
+      const input = row ? row.querySelector<HTMLInputElement>('.tag-admin-name-input') : null;
       updateTagDefinition(btn.dataset.tag, {name: input ? input.value : btn.dataset.tag}, true);
     });
   });
-  list.querySelectorAll('button[data-action="delete"]').forEach(btn => {
+  list.querySelectorAll<HTMLElement>('button[data-action="delete"]').forEach(btn => {
     btn.addEventListener('click', () => deleteTagDefinition(btn.dataset.tag));
   });
 }
 
-function setTagAdminSort(sort) {
-  tagAdminSort = ['name', 'image_count', 'user_count', 'auto_count'].includes(sort) ? sort : 'name';
+function setTagAdminSort(sort: string | undefined): void {
+  tagAdminSort = sort === 'image_count' || sort === 'user_count' || sort === 'auto_count' ? sort : 'name';
   renderTagAdmin();
 }
 
-async function createTagFromSettings() {
-  const input = document.getElementById('tag-admin-create');
+async function createTagFromSettings(): Promise<void> {
+  const input = requiredInput('tag-admin-create');
   const value = input.value.trim();
   if (!value) return;
   try {
@@ -1140,17 +1652,18 @@ async function createTagFromSettings() {
       body: JSON.stringify({name: value})
     });
     if (!r.ok) throw new Error(await readError(r));
-    const d = await r.json();
+    const d = await readJsonRecord(r);
     setTagPool(d.tags || [...allTagPool, d.tag || value]);
     input.value = '';
     renderAllTagSurfaces();
     updateFishGhosts();
   } catch (e) {
-    alert('Ошибка тега: ' + e.message);
+    alert('Ошибка тега: ' + errorMessage(e));
   }
 }
 
-async function updateTagDefinition(tag, body, reloadImages) {
+async function updateTagDefinition(tag: string | undefined, body: {name?: string; color?: string}, reloadImages: boolean): Promise<void> {
+  if (!tag) return;
   try {
     const r = await fetch(`/api/tags/${encodeURIComponent(tag)}`, {
       method: 'PATCH',
@@ -1158,59 +1671,65 @@ async function updateTagDefinition(tag, body, reloadImages) {
       body: JSON.stringify(body)
     });
     if (!r.ok) throw new Error(await readError(r));
-    const d = await r.json();
+    const d = await readJsonRecord(r);
     setTagPool(d.tags || []);
     if (reloadImages) await refreshImages(true);
     else renderAllTagSurfaces();
   } catch (e) {
-    alert('Ошибка тега: ' + e.message);
+    alert('Ошибка тега: ' + errorMessage(e));
     renderTagAdmin();
   }
 }
 
-async function deleteTagDefinition(tag) {
-  if (!confirm(`Удалить тег "${tag}"?`)) return;
+async function deleteTagDefinition(tag: string | undefined): Promise<void> {
+  if (!tag) return;
+  const meta = getTagMeta(tag);
+  const isAuto = Boolean(meta.is_auto || Number(meta.auto_count || 0) > 0);
+  const message = isAuto
+    ? `Удалить авто-тег "${tag}"? Он будет скрыт и не вернется после пересканирования, пока вы не создадите его вручную.`
+    : `Удалить тег "${tag}"?`;
+  if (!confirm(message)) return;
   try {
     const r = await fetch(`/api/tags/${encodeURIComponent(tag)}`, {method: 'DELETE'});
     if (!r.ok) throw new Error(await readError(r));
-    const d = await r.json();
+    const d = await readJsonRecord(r);
     setTagPool(d.tags || []);
     await refreshImages(true);
   } catch (e) {
-    alert('Ошибка тега: ' + e.message);
+    alert('Ошибка тега: ' + errorMessage(e));
   }
 }
 
-function scrollToTop() {
+function scrollToTop(): void {
   window.scrollTo({top: 0, behavior: 'smooth'});
 }
 
-function updateScrollTopButton() {
-  const btn = document.getElementById('scroll-top-btn');
+function updateScrollTopButton(): void {
+  const btn = optionalHtml('scroll-top-btn');
   if (!btn) return;
   btn.classList.toggle('visible', window.scrollY > 320);
 }
 
-function hasActiveModal() {
+function hasActiveModal(): boolean {
   return Boolean(
-    document.getElementById('settings-panel').classList.contains('open') ||
-    document.getElementById('tag-overlay').classList.contains('open') ||
-    document.getElementById('graph-overlay').classList.contains('open') ||
+    requiredHtml('settings-panel').classList.contains('open') ||
+    requiredHtml('tag-overlay').classList.contains('open') ||
+    requiredHtml('graph-overlay').classList.contains('open') ||
     (previewModal && previewModal.isOpen)
   );
 }
 
-function showChrome() {
+function showChrome(): void {
   document.body.classList.remove('chrome-hidden');
   document.documentElement.classList.remove('chrome-hidden');
 }
 
-function hideChrome() {
+function hideChrome(): void {
   document.body.classList.add('chrome-hidden');
   document.documentElement.classList.add('chrome-hidden');
 }
 
-function handleChromeScroll() {
+function handleChromeScroll(): void {
   const y = window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0;
   updateScrollTopButton();
   if (y < 64 || y < lastScrollY || hasActiveModal()) {
@@ -1221,9 +1740,11 @@ function handleChromeScroll() {
   lastScrollY = y;
 }
 
-function ensureGraphState() {
+function ensureGraphState(): GraphState {
   if (graphState) return graphState;
-  const canvas = document.getElementById('graph-canvas');
+  const canvas = requireElement('graph-canvas', HTMLCanvasElement, "Graph canvas is missing");
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('Graph canvas 2D context is unavailable.');
   graphState = {
     open: false,
     scope: 'current',
@@ -1243,62 +1764,64 @@ function ensureGraphState() {
     query: '',
     nodeLimit: 1000,
     canvas,
-    ctx: canvas.getContext('2d')
+    ctx
   };
+  const state = graphState;
   canvas.addEventListener('wheel', handleGraphWheel, {passive: false});
   canvas.addEventListener('mousedown', handleGraphMouseDown);
   window.addEventListener('mousemove', handleGraphMouseMove);
   window.addEventListener('mouseup', handleGraphMouseUp);
   canvas.addEventListener('dblclick', resetGraphLayout);
-  document.getElementById('graph-search').addEventListener('input', e => {
-    graphState.query = normalizeTag(e.target.value);
+  requiredInput('graph-search').addEventListener('input', e => {
+    const input = e.target as HTMLInputElement;
+    state.query = normalizeTag(input.value);
     renderGraph();
   });
-  return graphState;
+  return state;
 }
 
-function openGraph(scope) {
+function openGraph(scope: GraphScope | null = null): void {
   const state = ensureGraphState();
-  if (document.getElementById('settings-panel').classList.contains('open')) toggleSettings(false);
+  if (requiredHtml('settings-panel').classList.contains('open')) toggleSettings(false);
   state.open = true;
   if (scope) state.scope = scope;
-  document.getElementById('graph-overlay').classList.add('open');
-  document.getElementById('graph-overlay').setAttribute('aria-hidden', 'false');
+  requiredHtml('graph-overlay').classList.add('open');
+  requiredHtml('graph-overlay').setAttribute('aria-hidden', 'false');
   document.body.classList.add('modal-open');
   showChrome();
   updateGraphScopeButtons();
   rebuildGraph();
 }
 
-function closeGraph() {
+function closeGraph(): void {
   if (!graphState) return;
   graphState.open = false;
   if (graphState.raf) cancelAnimationFrame(graphState.raf);
   graphState.raf = null;
-  document.getElementById('graph-overlay').classList.remove('open');
-  document.getElementById('graph-overlay').setAttribute('aria-hidden', 'true');
-  if (!document.getElementById('settings-panel').classList.contains('open')) {
+  requiredHtml('graph-overlay').classList.remove('open');
+  requiredHtml('graph-overlay').setAttribute('aria-hidden', 'true');
+  if (!requiredHtml('settings-panel').classList.contains('open')) {
     document.body.classList.remove('modal-open');
   }
 }
 
-function setGraphScope(scope) {
+function setGraphScope(scope: string | undefined): void {
   const state = ensureGraphState();
   state.scope = scope === 'all' ? 'all' : 'current';
-  document.querySelectorAll('input[name="settings-graph-scope"]').forEach(input => {
+  document.querySelectorAll<HTMLInputElement>('input[name="settings-graph-scope"]').forEach(input => {
     input.checked = input.value === state.scope;
   });
   updateGraphScopeButtons();
   if (state.open) rebuildGraph();
 }
 
-function updateGraphScopeButtons() {
+function updateGraphScopeButtons(): void {
   const state = ensureGraphState();
-  document.getElementById('graph-scope-current').classList.toggle('active', state.scope !== 'all');
-  document.getElementById('graph-scope-all').classList.toggle('active', state.scope === 'all');
+  requiredHtml('graph-scope-current').classList.toggle('active', state.scope !== 'all');
+  requiredHtml('graph-scope-all').classList.toggle('active', state.scope === 'all');
 }
 
-function requestGraphRebuild() {
+function requestGraphRebuild(): void {
   if (!graphState || !graphState.open) return;
   graphState.needsRebuild = true;
   requestAnimationFrame(() => {
@@ -1306,24 +1829,24 @@ function requestGraphRebuild() {
   });
 }
 
-function graphImages() {
+function graphImages(): ImageItem[] {
   const state = ensureGraphState();
   return state.scope === 'all' ? allImages : visibleImages;
 }
 
-function rebuildGraph() {
+function rebuildGraph(): void {
   const state = ensureGraphState();
   state.needsRebuild = false;
   resizeGraphCanvas();
   const images = graphImages();
-  const tagMap = new Map();
-  const imageNodes = [];
-  const edges = [];
+  const tagMap = new Map<string, GraphTagNode>();
+  const imageNodes: GraphImageNode[] = [];
+  const edges: GraphEdge[] = [];
 
   images.forEach(img => {
     const tags = dedupeDisplayTags(img.tags || []);
     if (!tags.length) return;
-    const imageNode = {
+    const imageNode: GraphImageNode = {
       id: `img:${img.id}`,
       type: 'image',
       imageId: img.id,
@@ -1357,7 +1880,7 @@ function rebuildGraph() {
 
   const tagNodes = Array.from(tagMap.values());
   const totalNodes = tagNodes.length + imageNodes.length;
-  const notice = document.getElementById('graph-notice');
+  const notice = requiredHtml('graph-notice');
   if (totalNodes > state.nodeLimit) {
     state.nodes = [];
     state.edges = [];
@@ -1377,7 +1900,9 @@ function rebuildGraph() {
   });
   const tagById = new Map(tagNodes.map(node => [node.id, node]));
   imageNodes.forEach((node, i) => {
-    const linked = node.tags.map(tag => tagById.get(`tag:${normalizeTag(tag)}`)).filter(Boolean);
+    const linked = node.tags
+      .map(tag => tagById.get(`tag:${normalizeTag(tag)}`))
+      .filter((tag): tag is GraphTagNode => Boolean(tag));
     const baseX = linked.reduce((sum, tag) => sum + tag.x, 0) / Math.max(1, linked.length);
     const baseY = linked.reduce((sum, tag) => sum + tag.y, 0) / Math.max(1, linked.length);
     const jitter = 18 + (i % 23);
@@ -1394,7 +1919,7 @@ function rebuildGraph() {
   startGraphAnimation();
 }
 
-function resizeGraphCanvas() {
+function resizeGraphCanvas(): void {
   const state = ensureGraphState();
   const rect = state.canvas.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
@@ -1409,7 +1934,7 @@ function resizeGraphCanvas() {
   }
 }
 
-function startGraphAnimation() {
+function startGraphAnimation(): void {
   const state = ensureGraphState();
   if (state.raf) cancelAnimationFrame(state.raf);
   const step = () => {
@@ -1427,7 +1952,7 @@ function startGraphAnimation() {
   state.raf = requestAnimationFrame(step);
 }
 
-function simulateGraphTick() {
+function simulateGraphTick(): void {
   const state = ensureGraphState();
   const nodeById = new Map(state.nodes.map(node => [node.id, node]));
   const tagNodes = state.nodes.filter(node => node.type === 'tag');
@@ -1473,7 +1998,7 @@ function simulateGraphTick() {
   });
 }
 
-function renderGraph() {
+function renderGraph(): void {
   const state = ensureGraphState();
   const ctx = state.ctx;
   resizeGraphCanvas();
@@ -1530,7 +2055,7 @@ function renderGraph() {
   ctx.restore();
 }
 
-function graphPoint(event) {
+function graphPoint(event: MouseEvent | WheelEvent): GraphPoint {
   const state = ensureGraphState();
   const rect = state.canvas.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
@@ -1544,7 +2069,7 @@ function graphPoint(event) {
   };
 }
 
-function findGraphNode(point) {
+function findGraphNode(point: GraphPoint): GraphNode | null {
   const state = ensureGraphState();
   for (let i = state.nodes.length - 1; i >= 0; i--) {
     const node = state.nodes[i];
@@ -1554,7 +2079,7 @@ function findGraphNode(point) {
   return null;
 }
 
-function handleGraphWheel(event) {
+function handleGraphWheel(event: WheelEvent): void {
   const state = ensureGraphState();
   if (!state.open) return;
   event.preventDefault();
@@ -1567,7 +2092,7 @@ function handleGraphWheel(event) {
   renderGraph();
 }
 
-function handleGraphMouseDown(event) {
+function handleGraphMouseDown(event: MouseEvent): void {
   const state = ensureGraphState();
   if (!state.open || event.button !== 0) return;
   const point = graphPoint(event);
@@ -1579,7 +2104,7 @@ function handleGraphMouseDown(event) {
   state.canvas.classList.add('dragging');
 }
 
-function handleGraphMouseMove(event) {
+function handleGraphMouseMove(event: MouseEvent): void {
   const state = ensureGraphState();
   if (!state.open || (!state.dragNode && !state.isPanning)) return;
   const point = graphPoint(event);
@@ -1600,7 +2125,7 @@ function handleGraphMouseMove(event) {
   renderGraph();
 }
 
-function handleGraphMouseUp(event) {
+function handleGraphMouseUp(event: MouseEvent): void {
   const state = ensureGraphState();
   if (!state.open) return;
   const clickedNode = state.dragNode;
@@ -1615,7 +2140,7 @@ function handleGraphMouseUp(event) {
   }
 }
 
-function toggleGraphTagFilter(tag) {
+function toggleGraphTagFilter(tag: string): void {
   const tab = activeTab();
   const norm = normalizeTag(tag);
   if ((tab.includeTags || []).some(item => normalizeTag(item) === norm)) {
@@ -1626,7 +2151,7 @@ function toggleGraphTagFilter(tag) {
   renderGraph();
 }
 
-function openGraphImage(imageId) {
+function openGraphImage(imageId: string): void {
   const source = graphImages();
   const idx = source.findIndex(img => img.id === imageId);
   if (idx < 0) return;
@@ -1634,7 +2159,7 @@ function openGraphImage(imageId) {
   openLightbox(idx, true, source);
 }
 
-function resetGraphLayout() {
+function resetGraphLayout(): void {
   if (!graphState) return;
   graphState.scale = 1;
   graphState.panX = 0;
@@ -1642,15 +2167,20 @@ function resetGraphLayout() {
   if (graphState.open) rebuildGraph();
 }
 
-function initFishInput(inputId, ghostId, getExcluded, onCommit) {
-  const input = document.getElementById(inputId);
-  const ghost = document.getElementById(ghostId);
-  const controller = { suggestion: '' };
-  function update() {
+function initFishInput(
+  inputId: string,
+  ghostId: string,
+  getExcluded: (value: string) => string[],
+  onCommit: (tag: string) => void | Promise<void>
+): FishController {
+  const input = requiredInput(inputId);
+  const ghost = requiredHtml(ghostId);
+  const controller: FishController = { suggestion: '' };
+  function update(): void {
     const value = input.value;
     const parsed = splitTagPrefix(value);
     const q = normalizeTag(parsed.value);
-    const excluded = new Set((getExcluded ? getExcluded(value) : []).map(normalizeTag));
+    const excluded = new Set(getExcluded(value).map(normalizeTag));
     const suggestion = q
       ? allTagPool.find(tag => normalizeTag(tag).startsWith(q) && normalizeTag(tag) !== q && !excluded.has(normalizeTag(tag)))
       : '';
@@ -1685,25 +2215,25 @@ function initFishInput(inputId, ghostId, getExcluded, onCommit) {
   return controller;
 }
 
-let fishControllers = [];
-function initFishInputs() {
+let fishControllers: FishController[] = [];
+function initFishInputs(): void {
   fishControllers = [
     initFishInput('preview-tag-input', 'preview-tag-ghost', () => {
       const img = (lightboxImages.length ? lightboxImages : visibleImages)[lbIndex];
       return img ? img.tags || [] : [];
     }, tag => addTagToPreview(tag)),
     initFishInput('tag-create-input', 'tag-create-ghost', () => [], tag => {
-      document.getElementById('tag-create-input').value = tag;
+      requiredInput('tag-create-input').value = tag;
       createTagFromManager();
     })
   ];
 }
 
-function updateFishGhosts() {
+function updateFishGhosts(): void {
   fishControllers.forEach(controller => controller.update && controller.update());
 }
 
-async function openLightbox(idx, persist = true, sourceList = visibleImages) {
+async function openLightbox(idx: number, persist = true, sourceList: ImageItem[] = visibleImages): Promise<void> {
   lightboxImages = Array.isArray(sourceList) && sourceList.length ? sourceList : visibleImages;
   if (!lightboxImages[idx]) return;
   togglePreviewTagDropdown(false);
@@ -1716,17 +2246,18 @@ async function openLightbox(idx, persist = true, sourceList = visibleImages) {
   try {
     const canvas = await getOriginalCanvas(img);
     if (token !== previewRequestToken || !lightboxImages[lbIndex] || lightboxImages[lbIndex].id !== img.id) return;
+    if (!previewModal) return;
     previewModal.open(canvas);
     renderPreviewMeta(img, false);
     if (persist) saveSessionSoon();
     preloadPreviewNeighbors(idx);
   } catch (e) {
     console.error(e);
-    alert('Не удалось открыть изображение: ' + e.message);
+    alert('Не удалось открыть изображение: ' + errorMessage(e));
   }
 }
 
-function closePreview(clearLast = true) {
+function closePreview(clearLast = true): void {
   suppressPreviewCloseClear = !clearLast;
   if (previewModal && previewModal.isOpen) previewModal.close();
   suppressPreviewCloseClear = false;
@@ -1736,7 +2267,7 @@ function closePreview(clearLast = true) {
   }
 }
 
-function handlePreviewClosed() {
+function handlePreviewClosed(): void {
   document.body.style.overflow = '';
   togglePreviewTagDropdown(false);
   lightboxImages = [];
@@ -1746,45 +2277,45 @@ function handlePreviewClosed() {
   }
 }
 
-function previewNav(dir) {
+function previewNav(dir: number): void {
   const source = lightboxImages.length ? lightboxImages : visibleImages;
   if (!source.length) return;
   lbIndex = (lbIndex + dir + source.length) % source.length;
   openLightbox(lbIndex, true, source);
 }
 
-function renderPreviewMeta(img, loading) {
+function renderPreviewMeta(img: ImageItem, loading: boolean): void {
   const name = fileName(img.path);
-  document.getElementById('preview-name').textContent = loading ? `Загрузка: ${name}` : name;
-  document.getElementById('preview-size').textContent = `${fmtSize(img.size)} · ${img.width || '?'}×${img.height || '?'}`;
-  document.getElementById('preview-open').href = `/file/${img.id}`;
+  requiredHtml('preview-name').textContent = loading ? `Загрузка: ${name}` : name;
+  requiredHtml('preview-size').textContent = `${fmtSize(img.size)} · ${img.width || '?'}×${img.height || '?'}`;
+  requiredAnchor('preview-open').href = `/file/${img.id}`;
   renderPreviewTags(img);
 }
 
-function renderPreviewTags(img) {
-  const auto = document.getElementById('preview-auto-tags');
-  const user = document.getElementById('preview-user-tags');
+function renderPreviewTags(img: ImageItem): void {
+  const auto = requiredHtml('preview-auto-tags');
+  const user = requiredHtml('preview-user-tags');
   const autoTags = img.auto_tags || img.folder_tags || [];
   const userTags = img.user_tags || [];
   auto.innerHTML = autoTags.map(t => renderTagChip(t, {auto: true, className: 'preview-chip'})).join('');
   user.innerHTML = userTags.map(t => `
     ${renderTagChip(t, {removable: true, className: 'preview-chip'})}
   `).join('');
-  user.querySelectorAll('button[data-tag]').forEach(btn => {
+  user.querySelectorAll<HTMLElement>('button[data-tag]').forEach(btn => {
     btn.addEventListener('click', () => removeTagFromPreview(btn.dataset.tag));
   });
   renderPreviewTagDropdown();
 }
 
-function togglePreviewTagDropdown(force) {
-  const dropdown = document.getElementById('preview-tag-dropdown');
+function togglePreviewTagDropdown(force?: boolean): void {
+  const dropdown = requiredHtml('preview-tag-dropdown');
   const open = force === undefined ? !dropdown.classList.contains('open') : Boolean(force);
   dropdown.classList.toggle('open', open);
   if (open) renderPreviewTagDropdown();
 }
 
-function renderPreviewTagDropdown() {
-  const dropdown = document.getElementById('preview-tag-dropdown');
+function renderPreviewTagDropdown(): void {
+  const dropdown = optionalHtml('preview-tag-dropdown');
   if (!dropdown) return;
   const img = (lightboxImages.length ? lightboxImages : visibleImages)[lbIndex];
   const used = new Set((img ? img.tags || [] : []).map(normalizeTag));
@@ -1792,7 +2323,7 @@ function renderPreviewTagDropdown() {
   dropdown.innerHTML = tags.length
     ? tags.map(tag => `<button class="preview-pick-tag" type="button" data-tag="${escAttr(tag)}">${renderTagChip(tag, {count: true})}</button>`).join('')
     : `<span class="muted-inline">Нет доступных тегов для добавления</span>`;
-  dropdown.querySelectorAll('button[data-tag]').forEach(btn => {
+  dropdown.querySelectorAll<HTMLElement>('button[data-tag]').forEach(btn => {
     btn.addEventListener('click', async () => {
       await addTagToPreview(btn.dataset.tag);
       togglePreviewTagDropdown(false);
@@ -1800,8 +2331,8 @@ function renderPreviewTagDropdown() {
   });
 }
 
-async function addTagFromPreviewInput() {
-  const input = document.getElementById('preview-tag-input');
+async function addTagFromPreviewInput(): Promise<void> {
+  const input = requiredInput('preview-tag-input');
   const value = input.value.trim();
   if (!value) return;
   await addTagToPreview(value);
@@ -1809,21 +2340,23 @@ async function addTagFromPreviewInput() {
   updateFishGhosts();
 }
 
-async function addTagToPreview(tag) {
+async function addTagToPreview(tag: string | undefined): Promise<void> {
+  if (!tag) return;
   const img = (lightboxImages.length ? lightboxImages : visibleImages)[lbIndex];
   if (!img) return;
   const newTags = dedupeDisplayTags([...(img.user_tags || []), findDisplayTag(tag)]);
   await saveTags(img.id, newTags);
 }
 
-async function removeTagFromPreview(tag) {
+async function removeTagFromPreview(tag: string | undefined): Promise<void> {
+  if (!tag) return;
   const img = (lightboxImages.length ? lightboxImages : visibleImages)[lbIndex];
   if (!img) return;
   const newTags = (img.user_tags || []).filter(t => normalizeTag(t) !== normalizeTag(tag));
   await saveTags(img.id, newTags);
 }
 
-async function saveTags(id, userTags) {
+async function saveTags(id: string, userTags: string[]): Promise<void> {
   try {
     const r = await fetch(`/api/tag/${id}`, {
       method: 'POST',
@@ -1831,7 +2364,7 @@ async function saveTags(id, userTags) {
       body: JSON.stringify({tags: userTags})
     });
     if (!r.ok) throw new Error(await readError(r));
-    const updated = await r.json();
+    const updated = await readJsonRecord(r);
     updateImageTags(id, updated);
     await refreshTagPool();
   } catch (e) {
@@ -1839,15 +2372,15 @@ async function saveTags(id, userTags) {
   }
 }
 
-function updateImageTags(id, updated) {
-  let updatedImage = null;
+function updateImageTags(id: string, updated: JsonRecord): void {
+  let updatedImage: ImageItem | null = null;
   for (const list of [allImages, visibleImages]) {
     const img = list.find(item => item.id === id);
     if (!img) continue;
-    img.tags = updated.tags || [];
-    img.auto_tags = updated.auto_tags || updated.folder_tags || [];
+    img.tags = stringArray(updated.tags);
+    img.auto_tags = stringArray(updated.auto_tags).length ? stringArray(updated.auto_tags) : stringArray(updated.folder_tags);
     img.folder_tags = img.auto_tags;
-    img.user_tags = updated.user_tags || [];
+    img.user_tags = stringArray(updated.user_tags);
     updatedImage = img;
   }
   if (updatedImage) {
@@ -1859,9 +2392,10 @@ function updateImageTags(id, updated) {
   }
 }
 
-function getOriginalCanvas(img) {
-  if (canvasCache.has(img.id)) return canvasCache.get(img.id);
-  const promise = new Promise((resolve, reject) => {
+function getOriginalCanvas(img: ImageItem): Promise<HTMLCanvasElement> {
+  const cached = canvasCache.get(img.id);
+  if (cached) return cached;
+  const promise = new Promise<HTMLCanvasElement>((resolve, reject) => {
     const image = new Image();
     image.decoding = 'async';
     image.onload = () => {
@@ -1869,6 +2403,10 @@ function getOriginalCanvas(img) {
       canvas.width = image.naturalWidth || img.width || 1;
       canvas.height = image.naturalHeight || img.height || 1;
       const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        reject(new Error(img.path));
+        return;
+      }
       ctx.drawImage(image, 0, 0);
       resolve(canvas);
       trimCanvasCache();
@@ -1884,31 +2422,31 @@ function getOriginalCanvas(img) {
 function trimCanvasCache() {
   while (canvasCache.size > MAX_CANVAS_CACHE) {
     const first = canvasCache.keys().next().value;
-    canvasCache.delete(first);
+    if (first !== undefined) canvasCache.delete(first);
   }
 }
 
-function preloadPreviewNeighbors(idx) {
+function preloadPreviewNeighbors(idx: number): void {
   [-2, -1, 1, 2].forEach(offset => {
     const img = visibleImages[idx + offset];
     if (img) getOriginalCanvas(img).catch(() => {});
   });
 }
 
-function restorePreviewIfNeeded() {
+function restorePreviewIfNeeded(): void {
   const tab = activeTab();
   if (!tab.lastImageId) return;
   const idx = visibleImages.findIndex(img => img.id === tab.lastImageId);
-  if (idx >= 0 && !previewModal.isOpen) openLightbox(idx, false);
+  if (idx >= 0 && previewModal && !previewModal.isOpen) openLightbox(idx, false);
 }
 
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
     if (graphState && graphState.open) closeGraph();
-    if (document.getElementById('settings-panel').classList.contains('open')) toggleSettings(false);
+    if (requiredHtml('settings-panel').classList.contains('open')) toggleSettings(false);
   }
   if (!previewModal || !previewModal.isOpen) return;
-  if (e.target && ['INPUT', 'TEXTAREA'].includes(e.target.tagName)) return;
+  if (isTextEntryTarget(e.target)) return;
   if (e.key === 'ArrowLeft') previewNav(-1);
   else if (e.key === 'ArrowRight') previewNav(1);
 });
@@ -1919,16 +2457,16 @@ async function rescan() {
     if (!r.ok) throw new Error(await readError(r));
     startStatusPolling();
   } catch (e) {
-    alert('Ошибка: ' + e.message);
+    alert('Ошибка: ' + errorMessage(e));
   }
 }
 
-function saveSessionSoon() {
+function saveSessionSoon(): void {
   if (sessionSaveTimer) clearTimeout(sessionSaveTimer);
   sessionSaveTimer = setTimeout(saveSession, 250);
 }
 
-async function saveSession() {
+async function saveSession(): Promise<void> {
   saveActiveScroll();
   const tab = activeTab();
   const body = {
@@ -1938,6 +2476,7 @@ async function saveSession() {
       includeTags: item.includeTags || [],
       excludeTags: item.excludeTags || [],
       matchMode: item.matchMode === 'all' ? 'all' : 'any',
+      sortMode: isSortMode(item.sortMode) ? item.sortMode : DEFAULT_SORT_MODE,
       lastImageId: item.lastImageId || null,
       scrollTop: item.scrollTop || 0
     })),
@@ -1954,19 +2493,23 @@ async function saveSession() {
   } catch {}
 }
 
-async function loadSession() {
+async function loadSession(): Promise<void> {
   try {
     const r = await fetch('/api/session');
     if (!r.ok) throw new Error(await readError(r));
-    const s = await r.json();
+    const s = await readJsonRecord(r);
     tabs = normalizeTabs(s.tabs, s);
-    activeTabId = tabs.some(tab => tab.id === s.active_tab_id) ? s.active_tab_id : tabs[0].id;
+    const activeId = typeof s.active_tab_id === 'string' ? s.active_tab_id : null;
+    activeTabId = activeId && tabs.some(tab => tab.id === activeId) ? activeId : tabs[0].id;
     renderTabs();
     renderFilterControls();
-    if (s.root_path) {
-      document.getElementById('setup-folder').value = s.root_path;
-      document.getElementById('folder-input').value = s.root_path;
-      document.getElementById('current-root').textContent = s.root_path;
+    const rootPath = typeof s.root_path === 'string' ? s.root_path : '';
+    scannedRoots = Array.isArray(s.root_paths) && s.root_paths.length ? stringArray(s.root_paths) : (rootPath ? [rootPath] : []);
+    const currentRoot = scannedRoots[scannedRoots.length - 1] || rootPath;
+    if (currentRoot) {
+      setFolderInputValues(currentRoot);
+      updateRootSummary();
+      await refreshFolderTree();
       showGallery();
       startStatusPolling();
       await refreshImages(true);
@@ -1982,41 +2525,41 @@ async function loadSession() {
     renderTabs();
     renderFilterControls();
     showSetup();
-    setDbStatus(false, e.message);
+    setDbStatus(false, errorMessage(e));
   }
 }
 
-function normalizeTabs(rawTabs, session) {
+function normalizeTabs(rawTabs: unknown, session: JsonRecord): GalleryTab[] {
   if (Array.isArray(rawTabs) && rawTabs.length) {
-    return rawTabs.map((tab, i) => ({
-      id: String(tab.id || `tab-${i}`),
-      title: String(tab.title || 'Все фото'),
-      includeTags: dedupeDisplayTags(tab.includeTags || tab.include_tags || []),
-      excludeTags: dedupeDisplayTags(tab.excludeTags || tab.exclude_tags || []),
-      matchMode: tab.matchMode === 'all' || tab.match_mode === 'all' ? 'all' : 'any',
-      lastImageId: tab.lastImageId || tab.last_image_id || null,
-      scrollTop: Number(tab.scrollTop || tab.scroll_top || 0)
-    }));
+    const normalized: GalleryTab[] = rawTabs.filter(isRecord).map((tab, i) => {
+      const sortMode = String(tab.sortMode || tab.sort_mode || '');
+      return {
+        id: String(tab.id || `tab-${i}`),
+        title: String(tab.title || 'Все фото'),
+        includeTags: dedupeDisplayTags(tab.includeTags || tab.include_tags || []),
+        excludeTags: dedupeDisplayTags(tab.excludeTags || tab.exclude_tags || []),
+        matchMode: tab.matchMode === 'all' || tab.match_mode === 'all' ? 'all' : 'any',
+        sortMode: isSortMode(sortMode) ? sortMode : DEFAULT_SORT_MODE,
+        lastImageId: tab.lastImageId || tab.last_image_id ? String(tab.lastImageId || tab.last_image_id) : null,
+        scrollTop: Number(tab.scrollTop || tab.scroll_top || 0)
+      };
+    });
+    if (normalized.length) return normalized;
   }
   const tab = makeDefaultTab();
   tab.includeTags = dedupeDisplayTags(session.search_tags || []);
   tab.matchMode = session.search_mode === 'all' ? 'all' : 'any';
-  tab.lastImageId = session.last_image_id || null;
+  tab.sortMode = DEFAULT_SORT_MODE;
+  tab.lastImageId = session.last_image_id ? String(session.last_image_id) : null;
   updateTabTitle(tab);
   return [tab];
 }
 
-function initPreview() {
-  const baseClose = PreviewModal.prototype.close;
-  PreviewModal.prototype.close = function closeWithAppState() {
-    const wasOpen = this.isOpen;
-    baseClose.call(this);
-    if (wasOpen) handlePreviewClosed();
-  };
-  previewModal = new PreviewModal();
+function initPreview(): void {
+  previewModal = new PreviewModal({}, handlePreviewClosed);
 }
 
-function aspectCss(img) {
+function aspectCss(img: ImageItem): string {
   const w = Number(img.width || 0);
   const h = Number(img.height || 0);
   if (w > 0 && h > 0) return `${w} / ${h}`;
@@ -2024,29 +2567,112 @@ function aspectCss(img) {
   return `${Math.max(1, Math.round(ratio * 1000))} / 1000`;
 }
 
-function normalizeTag(tag) {
+function imageAspectRatio(img: ImageItem): number {
+  const width = Number(img.width || 0);
+  const height = Number(img.height || 0);
+  if (width > 0 && height > 0) return width / height;
+  const ratio = Number(img.aspect_ratio || 1);
+  return Number.isFinite(ratio) && ratio > 0 ? ratio : 1;
+}
+
+function masonryColumnTarget(): number {
+  const gallery = optionalHtml('gallery');
+  if (!gallery) return 1;
+  const width = gallery.clientWidth || window.innerWidth || MASONRY_COL_MIN;
+  const styles = getComputedStyle(gallery);
+  const gap = Number.parseFloat(styles.gap || styles.columnGap || '') || 10;
+  if (width < 720) return 1;
+  return Math.max(1, Math.floor((width + gap) / (MASONRY_COL_MIN + gap)));
+}
+
+function resetMasonryLayout(): void {
+  masonryColumns = [];
+  masonryHeights = [];
+  masonryColumnCount = 0;
+}
+
+function ensureMasonryLayout(force = false): void {
+  const gallery = optionalHtml('gallery');
+  if (!gallery) return;
+  const columnCount = masonryColumnTarget();
+  if (!force && masonryColumnCount === columnCount && masonryColumns.length === columnCount) return;
+  gallery.innerHTML = '';
+  masonryColumns = [];
+  masonryHeights = [];
+  masonryColumnCount = columnCount;
+  for (let i = 0; i < columnCount; i++) {
+    const column = document.createElement('div');
+    column.className = 'masonry-column';
+    gallery.appendChild(column);
+    masonryColumns.push(column);
+    masonryHeights.push(0);
+  }
+}
+
+function estimateCardHeight(img: ImageItem): number {
+  const gallery = optionalHtml('gallery');
+  if (!gallery) return MASONRY_COL_MIN;
+  const gap = Number.parseFloat(getComputedStyle(gallery).gap || '') || 10;
+  const columnWidth = masonryColumns[0] ? masonryColumns[0].clientWidth : MASONRY_COL_MIN;
+  return Math.max(48, columnWidth / imageAspectRatio(img)) + gap;
+}
+
+function placeMasonryCard(card: HTMLElement, img: ImageItem): void {
+  ensureMasonryLayout(false);
+  if (!masonryColumns.length) return;
+  let bestIndex = 0;
+  for (let i = 1; i < masonryHeights.length; i++) {
+    if (masonryHeights[i] < masonryHeights[bestIndex]) bestIndex = i;
+  }
+  masonryColumns[bestIndex].appendChild(card);
+  masonryHeights[bestIndex] += estimateCardHeight(img);
+}
+
+function layoutGallery(): void {
+  const count = renderedCount;
+  if (!count) {
+    resetMasonryLayout();
+    ensureMasonryLayout(true);
+    return;
+  }
+  const renderedImages = visibleImages.slice(0, count);
+  loadedIds.clear();
+  renderedCount = 0;
+  resetMasonryLayout();
+  ensureMasonryLayout(true);
+  renderedImages.forEach((img, idx) => {
+    if (loadedIds.has(img.id)) return;
+    loadedIds.add(img.id);
+    placeMasonryCard(makeCard(img, idx), img);
+    renderedCount += 1;
+  });
+  setupLazyLoad();
+}
+
+function normalizeTag(tag: unknown): string {
   return String(tag || '').trim().replace(/\s+/g, ' ').toLowerCase();
 }
 
-function tagName(tag) {
-  if (tag && typeof tag === 'object') return String(tag.name || '').trim().replace(/\s+/g, ' ');
+function tagName(tag: unknown): string {
+  if (isRecord(tag)) return String(tag.name || '').trim().replace(/\s+/g, ' ');
   return String(tag || '').trim().replace(/\s+/g, ' ');
 }
 
-function setTagPool(rawTags) {
+function setTagPool(rawTags: unknown): void {
   const previous = allTagMeta;
-  const nextMeta = new Map();
-  const names = [];
-  for (const item of rawTags || []) {
+  const nextMeta = new Map<string, TagMeta>();
+  const names: string[] = [];
+  const source = Array.isArray(rawTags) ? rawTags : [];
+  for (const item of source) {
     const name = tagName(item);
     const norm = normalizeTag(name);
     if (!name || nextMeta.has(norm)) continue;
-    const old = previous.get(norm) || {};
-    const meta = typeof item === 'object' && item !== null
+    const old = (previous.get(norm) || {}) as Partial<TagMeta>;
+    const meta: TagMeta = isRecord(item)
       ? {
         name,
-        normalized: item.normalized || norm,
-        color: item.color || null,
+        normalized: String(item.normalized || norm),
+        color: typeof item.color === 'string' ? item.color : null,
         image_count: Number(item.image_count || 0),
         auto_count: Number(item.auto_count || 0),
         user_count: Number(item.user_count || 0),
@@ -2068,7 +2694,7 @@ function setTagPool(rawTags) {
   allTagPool = names;
 }
 
-function getTagMeta(tag) {
+function getTagMeta(tag: unknown): TagMeta {
   const name = tagName(tag);
   const norm = normalizeTag(name);
   return allTagMeta.get(norm) || {
@@ -2082,12 +2708,12 @@ function getTagMeta(tag) {
   };
 }
 
-function normalizeHexColor(value, fallback = '#D4D4D4') {
+function normalizeHexColor(value: unknown, fallback = '#D4D4D4'): string {
   const color = String(value || '').trim();
   return /^#[0-9a-fA-F]{6}$/.test(color) ? color.toUpperCase() : fallback;
 }
 
-function hexToRgbTriplet(hex) {
+function hexToRgbTriplet(hex: unknown): string {
   const color = normalizeHexColor(hex);
   const value = color.slice(1);
   return [
@@ -2097,7 +2723,7 @@ function hexToRgbTriplet(hex) {
   ].join(', ');
 }
 
-function renderTagChip(tag, options = {}) {
+function renderTagChip(tag: unknown, options: TagChipOptions = {}): string {
   const name = tagName(tag);
   const meta = getTagMeta(name);
   const color = normalizeHexColor(meta.color, '#D4D4D4');
@@ -2116,7 +2742,7 @@ function renderTagChip(tag, options = {}) {
   return `<span class="${classes}" style="--tag-color:${escAttr(color)};--tag-rgb:${escAttr(rgb)}" title="${escAttr(label)}"><span class="tag-label">${escHtml(label)}</span>${count}${remove}</span>`;
 }
 
-function splitTagPrefix(value) {
+function splitTagPrefix(value: unknown): TagInputParse {
   const raw = String(value || '').trim().replace(/\s+/g, ' ');
   if (raw.startsWith('!') || raw.startsWith('-')) {
     return {prefix: raw[0], value: raw.slice(1).trim()};
@@ -2124,10 +2750,11 @@ function splitTagPrefix(value) {
   return {prefix: '', value: raw};
 }
 
-function dedupeDisplayTags(tags) {
-  const seen = new Set();
-  const result = [];
-  for (const tag of tags || []) {
+function dedupeDisplayTags(tags: unknown): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  const source = Array.isArray(tags) ? tags : [];
+  for (const tag of source) {
     const value = tagName(tag);
     const norm = normalizeTag(value);
     if (!value || seen.has(norm)) continue;
@@ -2137,18 +2764,19 @@ function dedupeDisplayTags(tags) {
   return result;
 }
 
-function findDisplayTag(tag) {
+function findDisplayTag(tag: unknown): string {
   const value = tagName(tag);
   const norm = normalizeTag(value);
   return allTagPool.find(item => normalizeTag(item) === norm) || value;
 }
 
-function cssEscape(value) {
-  if (window.CSS && typeof window.CSS.escape === 'function') return window.CSS.escape(value);
-  return String(value).replace(/"/g, '\\"');
+function cssEscape(value: unknown): string {
+  const text = String(value);
+  if (window.CSS && typeof window.CSS.escape === 'function') return window.CSS.escape(text);
+  return text.replace(/"/g, '\\"');
 }
 
-function escHtml(s) {
+function escHtml(s: unknown): string {
   return String(s)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -2157,59 +2785,153 @@ function escHtml(s) {
     .replace(/'/g, '&#39;');
 }
 
-function escAttr(s) {
+function escAttr(s: unknown): string {
   return escHtml(s);
 }
 
-function fileName(path) {
+function fileName(path: unknown): string {
   return String(path || '').split(/[/\\]/).pop() || '';
 }
 
-function fmtSize(bytes) {
-  if (!Number.isFinite(Number(bytes))) return '';
-  if (bytes < 1024) return bytes + ' B';
-  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
-  return (bytes / 1048576).toFixed(1) + ' MB';
+function fmtSize(bytes: unknown): string {
+  const value = Number(bytes);
+  if (!Number.isFinite(value)) return '';
+  if (value < 1024) return value + ' B';
+  if (value < 1048576) return (value / 1024).toFixed(1) + ' KB';
+  return (value / 1048576).toFixed(1) + ' MB';
 }
 
-async function readError(response) {
+async function readError(response: Response): Promise<string> {
   try {
-    const data = await response.json();
-    return data.detail || data.error || response.statusText;
+    const data = await readJsonRecord(response);
+    return String(data.detail || data.error || response.statusText);
   } catch {
     return response.statusText;
   }
 }
 
-document.getElementById('tag-overlay').addEventListener('click', e => {
-  if (e.target === document.getElementById('tag-overlay')) closeTagManager();
+function runAction(actionEl: HTMLElement): void {
+  const action = actionEl.dataset.action;
+  switch (action) {
+    case 'add-tab':
+      addTab();
+      break;
+    case 'add-tag-from-preview-input':
+      addTagFromPreviewInput();
+      break;
+    case 'apply-tag-manager-selection':
+      applyTagManagerSelection();
+      break;
+    case 'clear-active-filters':
+      clearActiveFilters();
+      break;
+    case 'close-graph':
+      closeGraph();
+      break;
+    case 'close-tag-manager':
+      closeTagManager();
+      break;
+    case 'create-tag-from-manager':
+      createTagFromManager();
+      break;
+    case 'create-tag-from-settings':
+      createTagFromSettings();
+      break;
+    case 'open-folder':
+      openFolder();
+      break;
+    case 'open-graph':
+      openGraph();
+      break;
+    case 'open-tag-manager':
+      openTagManager();
+      break;
+    case 'pick-folder':
+      pickFolder();
+      break;
+    case 'preview-nav':
+      previewNav(Number(actionEl.dataset.dir || 0));
+      break;
+    case 'rescan':
+      rescan();
+      break;
+    case 'reset-graph-layout':
+      resetGraphLayout();
+      break;
+    case 'scroll-to-top':
+      scrollToTop();
+      break;
+    case 'set-graph-scope':
+      setGraphScope(actionEl.dataset.scope || actionValue(actionEl));
+      break;
+    case 'set-match-mode':
+      setMatchMode(actionEl.dataset.mode);
+      break;
+    case 'set-settings-tab':
+      setSettingsTab(actionEl.dataset.settingsTab);
+      break;
+    case 'toggle-create-tag-panel':
+      toggleCreateTagPanel(actionEl.dataset.open !== 'false');
+      break;
+    case 'toggle-folder-sidebar':
+      toggleFolderSidebar();
+      break;
+    case 'toggle-preview-tag-dropdown':
+      togglePreviewTagDropdown();
+      break;
+    case 'toggle-settings':
+      if (actionEl.dataset.open === undefined) toggleSettings();
+      else toggleSettings(actionEl.dataset.open === 'true');
+      break;
+  }
+}
+
+function initActionBindings(): void {
+  document.addEventListener('click', e => {
+    const actionEl = closestFromEvent(e, '[data-action]');
+    if (!actionEl) return;
+    runAction(actionEl);
+  });
+
+  document.addEventListener('change', e => {
+    const actionEl = closestFromEvent(e, '[data-action]');
+    if (!actionEl) return;
+    if (actionEl.dataset.action === 'set-sort-mode') setSortMode(actionValue(actionEl));
+    else if (actionEl.dataset.action === 'set-tag-admin-sort') setTagAdminSort(actionValue(actionEl));
+    else if (actionEl.dataset.action === 'set-graph-scope') setGraphScope(actionEl.dataset.scope || actionValue(actionEl));
+  });
+}
+
+requiredHtml('tag-overlay').addEventListener('click', e => {
+  if (e.target === requiredHtml('tag-overlay')) closeTagManager();
 });
 
-document.getElementById('settings-panel').addEventListener('click', e => {
-  if (e.target === document.getElementById('settings-panel')) toggleSettings(false);
+requiredHtml('settings-panel').addEventListener('click', e => {
+  if (e.target === requiredHtml('settings-panel')) toggleSettings(false);
 });
 
-document.getElementById('graph-overlay').addEventListener('click', e => {
-  if (e.target === document.getElementById('graph-overlay')) closeGraph();
+requiredHtml('graph-overlay').addEventListener('click', e => {
+  if (e.target === requiredHtml('graph-overlay')) closeGraph();
 });
 
 document.addEventListener('click', e => {
-  const settings = document.getElementById('settings-panel');
-  const settingsToggle = document.getElementById('settings-toggle');
-  if (settings.classList.contains('open') && !settings.contains(e.target) && e.target !== settingsToggle && !settingsToggle.contains(e.target)) {
+  const targetNode = e.target instanceof Node ? e.target : null;
+  const settings = requiredHtml('settings-panel');
+  const settingsToggle = requiredHtml('settings-toggle');
+  if (targetNode && settings.classList.contains('open') && !settings.contains(targetNode) && targetNode !== settingsToggle && !settingsToggle.contains(targetNode)) {
     toggleSettings(false);
   }
   const filterWrap = document.querySelector('.filter-input-wrap');
-  if (filterWrap && !filterWrap.contains(e.target)) {
+  if (targetNode && filterWrap && !filterWrap.contains(targetNode)) {
     filterSuggestionOpen = false;
     renderFilterSuggestions();
   }
   const previewTools = document.querySelector('.preview-user-tools');
-  if (previewTools && !previewTools.contains(e.target)) togglePreviewTagDropdown(false);
+  if (targetNode && previewTools && !previewTools.contains(targetNode)) togglePreviewTagDropdown(false);
 });
 
-document.getElementById('tag-admin-search').addEventListener('input', renderTagAdmin);
-document.getElementById('tag-admin-create').addEventListener('keydown', e => {
+requiredInput('tag-admin-search').addEventListener('input', renderTagAdmin);
+requiredInput('tag-admin-create').addEventListener('keydown', e => {
   if (e.key === 'Enter') createTagFromSettings();
 });
 window.addEventListener('scroll', handleChromeScroll, {passive: true});
@@ -2217,9 +2939,11 @@ document.addEventListener('scroll', handleChromeScroll, {passive: true, capture:
 window.addEventListener('wheel', () => requestAnimationFrame(handleChromeScroll), {passive: true});
 window.addEventListener('touchmove', () => requestAnimationFrame(handleChromeScroll), {passive: true});
 window.addEventListener('resize', () => {
+  layoutGallery();
   if (graphState && graphState.open) rebuildGraph();
 });
 
+initActionBindings();
 initPreview();
 initFilterInput();
 initFishInputs();

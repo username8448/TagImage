@@ -3,20 +3,16 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ImgViewer</title>
+<title>TagImage</title>
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
 <div id="app">
-  <section id="setup-screen">
+  <section id="setup-screen" style="display:none;">
     <div class="setup-panel">
       <div class="brand">
-        <h1>Img<span>Viewer</span></h1>
+        <h1>Загрузка</h1>
         <small id="setup-db-status">PostgreSQL</small>
-      </div>
-      <div id="setup-row">
-        <input id="setup-folder" type="text" placeholder="/home/user/Pictures">
-        <button class="btn btn-primary" onclick="openFolder()">Открыть</button>
       </div>
       <div id="setup-hint">
         Локальное хранилище: <code>PostgreSQL</code>. Миниатюры остаются рядом с фото в <code>.imgindex/thumbs/</code>.
@@ -26,15 +22,30 @@
   </section>
 
   <section id="gallery-screen" style="display:none;">
+    <aside id="folder-sidebar" class="collapsed" aria-label="Просканированные папки">
+      <div id="folder-sidebar-panel">
+        <div class="folder-sidebar-head">
+          <div>
+            <span>Папки</span>
+            <small>Можно добавить несколько путей</small>
+          </div>
+          <div class="folder-sidebar-actions">
+            <button class="btn btn-ghost icon-btn" type="button" data-action="rescan" id="rescan-btn" title="Пересканировать" aria-label="Пересканировать">↻</button>
+            <button class="btn btn-primary btn-sm folder-open-btn" type="button" data-action="pick-folder">Открыть папку</button>
+          </div>
+        </div>
+        <div id="folder-tree"></div>
+      </div>
+    </aside>
     <header id="topbar">
-      <div id="logo">Img<span>Viewer</span></div>
+      <button id="folder-sidebar-toggle" type="button" data-action="toggle-folder-sidebar" title="Папки">☰</button>
       <div id="tabbar">
         <div id="tabs"></div>
-        <button id="add-tab-btn" class="btn btn-ghost icon-btn" onclick="addTab()" title="Новая вкладка">+</button>
+        <button id="add-tab-btn" class="btn btn-ghost icon-btn" data-action="add-tab" title="Новая вкладка">+</button>
       </div>
       <div id="top-summary"><span id="count-text"></span></div>
       <div class="top-actions">
-        <button id="settings-toggle" class="btn btn-ghost icon-btn" onclick="toggleSettings()" title="Настройки">⚙</button>
+        <button id="settings-toggle" class="btn btn-ghost icon-btn" data-action="toggle-settings" title="Настройки">⚙</button>
       </div>
     </header>
 
@@ -42,28 +53,24 @@
       <section class="settings-workspace" role="dialog" aria-modal="true" aria-label="Настройки">
         <header class="settings-head">
           <div>
-            <div class="settings-kicker">ImgViewer</div>
+            <div class="settings-kicker">TagImage</div>
             <h2>Настройки</h2>
           </div>
-          <button class="btn btn-ghost icon-btn" type="button" onclick="toggleSettings(false)" title="Закрыть">×</button>
+          <button class="btn btn-ghost icon-btn" type="button" data-action="toggle-settings" data-open="false" title="Закрыть">×</button>
         </header>
         <nav class="settings-tabs" aria-label="Разделы настроек">
-          <button class="settings-tab active" type="button" data-settings-tab="general" onclick="setSettingsTab('general')">Общее</button>
-          <button class="settings-tab" type="button" data-settings-tab="tags" onclick="setSettingsTab('tags')">Теги</button>
-          <button class="settings-tab" type="button" data-settings-tab="graph" onclick="setSettingsTab('graph')">Граф</button>
+          <button class="settings-tab active" type="button" data-action="set-settings-tab" data-settings-tab="general">Общее</button>
+          <button class="settings-tab" type="button" data-action="set-settings-tab" data-settings-tab="tags">Теги</button>
+          <button class="settings-tab" type="button" data-action="set-settings-tab" data-settings-tab="graph">Граф</button>
         </nav>
         <div class="settings-body">
           <section class="settings-panel-page active" data-settings-panel="general">
             <div class="settings-section">
               <div class="settings-section-head">
                 <h3>Директория</h3>
-                <button class="btn btn-ghost btn-sm" onclick="rescan()" id="rescan-btn">Сканировать</button>
+                <button class="btn btn-ghost icon-btn" data-action="rescan" title="Пересканировать" aria-label="Пересканировать">↻</button>
               </div>
               <div id="current-root" class="settings-value">Папка не выбрана</div>
-              <div class="settings-inline">
-                <input id="folder-input" type="text" placeholder="Путь к папке">
-                <button class="btn btn-primary" onclick="openFolder()">Открыть</button>
-              </div>
             </div>
             <div class="settings-section settings-grid">
               <div>
@@ -83,12 +90,12 @@
                 <h3>Теги</h3>
                 <div class="settings-tag-actions">
                   <input id="tag-admin-create" type="text" placeholder="Новый тег" autocomplete="off">
-                  <button class="btn btn-primary btn-sm" type="button" onclick="createTagFromSettings()">Создать</button>
+                  <button class="btn btn-primary btn-sm" type="button" data-action="create-tag-from-settings">Создать</button>
                 </div>
               </div>
               <div class="tag-admin-toolbar">
                 <input id="tag-admin-search" type="text" placeholder="Поиск тегов" autocomplete="off">
-                <select id="tag-admin-sort" onchange="setTagAdminSort(this.value)">
+                <select id="tag-admin-sort" data-action="set-tag-admin-sort">
                   <option value="name">По имени</option>
                   <option value="image_count">По фото</option>
                   <option value="user_count">По ручным</option>
@@ -102,12 +109,12 @@
             <div class="settings-section">
               <div class="settings-section-head">
                 <h3>Граф</h3>
-                <button class="btn btn-primary btn-sm" type="button" onclick="openGraph()">Открыть граф</button>
+                <button class="btn btn-primary btn-sm" type="button" data-action="open-graph">Открыть граф</button>
               </div>
               <div class="settings-graph-controls">
-                <label class="radio-line"><input type="radio" name="settings-graph-scope" value="current" checked onchange="setGraphScope('current')"> Текущая выборка</label>
-                <label class="radio-line"><input type="radio" name="settings-graph-scope" value="all" onchange="setGraphScope('all')"> Все фото</label>
-                <button class="btn btn-ghost btn-sm" type="button" onclick="resetGraphLayout()">Сбросить раскладку</button>
+                <label class="radio-line"><input type="radio" name="settings-graph-scope" value="current" checked data-action="set-graph-scope"> Текущая выборка</label>
+                <label class="radio-line"><input type="radio" name="settings-graph-scope" value="all" data-action="set-graph-scope"> Все фото</label>
+                <button class="btn btn-ghost btn-sm" type="button" data-action="reset-graph-layout">Сбросить раскладку</button>
               </div>
               <div class="settings-note">Теги показаны ромбами. Фото показаны маленькими кругами без превью и имен.</div>
             </div>
@@ -119,12 +126,12 @@
     <div id="filter-bar">
       <div class="filter-head">
         <div class="match-toggle">
-          <button id="match-any" type="button" onclick="setMatchMode('any')">Любой</button>
-          <button id="match-all" type="button" onclick="setMatchMode('all')">Все</button>
+          <button id="match-any" type="button" data-action="set-match-mode" data-mode="any">Любой</button>
+          <button id="match-all" type="button" data-action="set-match-mode" data-mode="all">Все</button>
         </div>
-        <button class="btn btn-ghost btn-sm" onclick="clearActiveFilters()">Сбросить</button>
-        <button class="btn btn-ghost btn-sm" onclick="openTagManager()">Список тегов</button>
-        <button class="btn btn-ghost btn-sm" onclick="openGraph()">Граф</button>
+        <button class="btn btn-ghost btn-sm" data-action="clear-active-filters">Сбросить</button>
+        <button class="btn btn-ghost btn-sm" data-action="open-tag-manager">Список тегов</button>
+        <button class="btn btn-ghost btn-sm" data-action="open-graph">Граф</button>
         <div class="filter-input-wrap">
           <div class="fish-field">
             <div id="filter-tag-ghost" class="fish-ghost"></div>
@@ -132,6 +139,14 @@
           </div>
           <div id="filter-suggestion-list"></div>
         </div>
+        <select id="sort-select" class="sort-select" data-action="set-sort-mode" title="Сортировка">
+          <option value="date_desc">Сначала новые</option>
+          <option value="date_asc">Сначала старые</option>
+          <option value="path_asc">Имя A-Z</option>
+          <option value="path_desc">Имя Z-A</option>
+          <option value="size_desc">Сначала большие</option>
+          <option value="size_asc">Сначала маленькие</option>
+        </select>
       </div>
       <div id="selected-filter-tags" class="chip-row"></div>
     </div>
@@ -146,15 +161,15 @@
       </div>
     </main>
 
-    <button id="scroll-top-btn" type="button" onclick="scrollToTop()" title="Наверх">↑</button>
+    <button id="scroll-top-btn" type="button" data-action="scroll-to-top" title="Наверх">↑</button>
   </section>
 </div>
 
 <div id="preview-modal">
   <button id="preview-close" class="btn btn-ghost icon-btn" title="Закрыть">×</button>
-  <button id="preview-prev" title="Назад" onclick="previewNav(-1)">‹</button>
+  <button id="preview-prev" title="Назад" data-action="preview-nav" data-dir="-1">‹</button>
   <canvas id="preview-modal-canvas"></canvas>
-  <button id="preview-next" title="Вперед" onclick="previewNav(1)">›</button>
+  <button id="preview-next" title="Вперед" data-action="preview-nav" data-dir="1">›</button>
   <div id="preview-dock">
     <div class="preview-info">
       <div id="preview-name"></div>
@@ -175,8 +190,8 @@
           <div id="preview-tag-ghost" class="fish-ghost"></div>
           <input id="preview-tag-input" type="text" placeholder="Добавить тег" autocomplete="off">
         </div>
-        <button id="preview-tag-pick" class="btn btn-ghost btn-sm" onclick="togglePreviewTagDropdown()" title="Выбрать из списка">▾</button>
-        <button class="btn btn-primary btn-sm" onclick="addTagFromPreviewInput()">Добавить</button>
+        <button id="preview-tag-pick" class="btn btn-ghost btn-sm" data-action="toggle-preview-tag-dropdown" title="Выбрать из списка">▾</button>
+        <button class="btn btn-primary btn-sm" data-action="add-tag-from-preview-input">Добавить</button>
       </div>
     </div>
   </div>
@@ -185,17 +200,17 @@
 <div id="tag-overlay">
   <section id="tag-center">
     <div class="tag-manager-row">
-      <button class="btn btn-primary" onclick="applyTagManagerSelection()">Принять</button>
+      <button class="btn btn-primary" data-action="apply-tag-manager-selection">Принять</button>
       <div id="tag-manager-selected"></div>
-      <button class="btn btn-ghost icon-btn" onclick="closeTagManager()">×</button>
+      <button class="btn btn-ghost icon-btn" data-action="close-tag-manager">×</button>
     </div>
     <div id="tag-create-panel">
       <div class="fish-field">
         <div id="tag-create-ghost" class="fish-ghost"></div>
         <input id="tag-create-input" type="text" placeholder="Новый тег" autocomplete="off">
       </div>
-      <button class="btn btn-primary btn-sm" onclick="createTagFromManager()">Создать</button>
-      <button class="btn btn-ghost btn-sm" onclick="toggleCreateTagPanel(false)">Отмена</button>
+      <button class="btn btn-primary btn-sm" data-action="create-tag-from-manager">Создать</button>
+      <button class="btn btn-ghost btn-sm" data-action="toggle-create-tag-panel" data-open="false">Отмена</button>
     </div>
     <div id="tag-list"></div>
   </section>
@@ -208,21 +223,21 @@
         <div class="settings-kicker">Graph</div>
         <h2>Связи тегов и фото</h2>
       </div>
-      <button class="btn btn-ghost icon-btn" type="button" onclick="closeGraph()" title="Закрыть">×</button>
+      <button class="btn btn-ghost icon-btn" type="button" data-action="close-graph" title="Закрыть">×</button>
     </header>
     <div class="graph-toolbar">
       <div class="match-toggle">
-        <button id="graph-scope-current" type="button" onclick="setGraphScope('current')">Текущая выборка</button>
-        <button id="graph-scope-all" type="button" onclick="setGraphScope('all')">Все фото</button>
+        <button id="graph-scope-current" type="button" data-action="set-graph-scope" data-scope="current">Текущая выборка</button>
+        <button id="graph-scope-all" type="button" data-action="set-graph-scope" data-scope="all">Все фото</button>
       </div>
       <input id="graph-search" type="text" placeholder="Найти тег" autocomplete="off">
-      <button class="btn btn-ghost btn-sm" type="button" onclick="resetGraphLayout()">Сбросить</button>
+      <button class="btn btn-ghost btn-sm" type="button" data-action="reset-graph-layout">Сбросить</button>
     </div>
     <div id="graph-notice"></div>
     <canvas id="graph-canvas"></canvas>
   </section>
 </div>
 
-<script src="/static/app.js"></script>
+<script defer src="/static/dist/app.js"></script>
 </body>
 </html>

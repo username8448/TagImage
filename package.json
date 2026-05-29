@@ -1,9 +1,9 @@
 {
-  "name": "imgviewer-frontend",
+  "name": "tagimage-frontend",
   "private": true,
   "version": "0.1.0",
   "scripts": {
-    "build:frontend": "esbuild static/src/app.ts --bundle --platform=browser --target=es2020 --outfile=static/app.js && cp static/src/styles.css static/app.css",
+    "build:frontend": "tsc --noEmit && mkdir -p static/dist && esbuild static/src/main.ts --bundle --platform=browser --format=iife --target=es2020 --outfile=static/dist/app.js && cp static/src/styles.css static/app.css",
     "typecheck:frontend": "tsc --noEmit"
   },
   "devDependencies": {

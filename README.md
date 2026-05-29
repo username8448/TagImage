@@ -14,15 +14,18 @@ docker compose up -d postgres
 
 ```bash
 pip install -r requirements.txt
+npm install
 ```
 
 3. Запустить:
 
 ```bash
-python run.py /путь/к/фото
+./start.sh /путь/к/фото
 # или
-python run.py
+./start.sh
 ```
+
+`./start.sh` проверит frontend-зависимости и соберет TS bundle перед запуском. Если запускаешь backend напрямую через `python run.py`, сначала выполни `npm run build:frontend`.
 
 По умолчанию используется:
 
@@ -189,10 +192,12 @@ BASE_URL=http://127.0.0.1:8000 ./scripts/bench-images.sh
 
 ## Frontend Build
 
-Фронт разделен на `static/app.css` и `static/app.js`; TS/CSS исходники лежат в `static/src/`.
+Фронт собирается из TS/CSS исходников в `static/src/`. JS-бандл создается локально как `static/dist/app.js` и не хранится в git.
 
 ```bash
 npm install
 npm run typecheck:frontend
 npm run build:frontend
 ```
+
+`./start.sh` перед запуском backend проверяет наличие npm/node_modules и собирает frontend. Скрипт не запускает `npm install` автоматически: для офлайн-запуска зависимости должны быть установлены заранее.

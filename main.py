@@ -19,8 +19,8 @@ if __name__ == "__main__":
     if folder:
         try:
             set_root(folder)
-            print(f"[imgviewer] Root: {folder}")
-            print("[imgviewer] Starting background scan")
+            print(f"[tagimage] Root: {folder}")
+            print("[tagimage] Starting background scan")
             threading.Thread(target=build_index_sync, daemon=True).start()
         except ValueError as exc:
             print(f"Error: {exc}")
@@ -29,5 +29,5 @@ if __name__ == "__main__":
             print(f"Database error: {exc}")
             sys.exit(1)
 
-    print("[imgviewer] Open http://localhost:8000")
+    print("[tagimage] Open http://localhost:8000")
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
