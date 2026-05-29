@@ -133,6 +133,175 @@ def tag_summary_by_norm(norm: str) -> Optional[dict[str, Any]]:
     return None
 
 
+def create_user_tag_entry(name: str) -> dict[str, Any]:
+    ensure_db_ready()
+    cleaned = clean_tag_list([name])
+    if not cleaned:
+        raise HTTPException(400, "Tag name is empty")
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            ensure_tag(cur, cleaned[0], user_defined=True)
+    return tag_summary_by_norm(normalize_tag(cleaned[0])) or {
+        "name": cleaned[0],
+        "color": None,
+        "image_count": 0,
+        "auto_count": 0,
+        "user_count": 0,
+        "user_defined": True,
+        "is_auto": False,
+    }
+
+
+def update_tag_definition(
+    tag: str,
+    *,
+    name: Optional[str],
+    color: Optional[str],
+    has_name: bool,
+    has_color: bool,
+) -> dict[str, Any]:
+    ensure_db_ready()
+    new_name: Optional[str] = None
+    if has_name and name is not None:
+        cleaned = clean_tag_list([name])
+        if not cleaned:
+            raise HTTPException(400, "Tag name is empty")
+        new_name = cleaned[0]
+
+    new_color = normalize_color(color) if has_color else None
+    source_norm = normalize_tag(tag)
+    final_norm = source_norm
+
+    with db_connect(row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    t.id,
+                    t.name,
+                    t.normalized,
+                    COUNT(DISTINCT CASE WHEN it.kind = 'auto' THEN it.image_id END) AS auto_count
+                FROM tags t
+                LEFT JOIN image_tags it ON it.tag_id = t.id
+                WHERE t.normalized = %s
+                GROUP BY t.id
+                """,
+                (source_norm,),
+            )
+            source = cur.fetchone()
+            if source is None:
+                raise HTTPException(404, "Tag not found")
+
+            target_id = source["id"]
+            if new_name is not None:
+                new_norm = normalize_tag(new_name)
+                cur.execute("DELETE FROM suppressed_auto_tags WHERE normalized = %s", (new_norm,))
+                source_is_auto = int(source["auto_count"] or 0) > 0
+                if source_is_auto and new_name != source["name"]:
+                    raise HTTPException(400, "Folder tags cannot be renamed")
+
+                if new_norm == source["normalized"]:
+                    if new_name != source["name"]:
+                        cur.execute(
+                            "UPDATE tags SET name = %s, user_defined = true WHERE id = %s",
+                            (new_name, source["id"]),
+                        )
+                    elif not source_is_auto:
+                        cur.execute("UPDATE tags SET user_defined = true WHERE id = %s", (source["id"],))
+                    final_norm = new_norm
+                else:
+                    if source_is_auto:
+                        raise HTTPException(400, "Folder tags cannot be renamed")
+                    cur.execute(
+                        """
+                        SELECT
+                            t.id,
+                            t.name,
+                            t.normalized,
+                            COUNT(DISTINCT CASE WHEN it.kind = 'auto' THEN it.image_id END) AS auto_count
+                        FROM tags t
+                        LEFT JOIN image_tags it ON it.tag_id = t.id
+                        WHERE t.normalized = %s
+                        GROUP BY t.id
+                        """,
+                        (new_norm,),
+                    )
+                    target = cur.fetchone()
+                    if target is not None:
+                        if int(target["auto_count"] or 0) > 0:
+                            raise HTTPException(400, "Cannot merge into a folder tag")
+                        cur.execute(
+                            """
+                            INSERT INTO image_tags (image_id, tag_id, kind, created_at)
+                            SELECT image_id, %s, kind, created_at
+                            FROM image_tags
+                            WHERE tag_id = %s
+                            ON CONFLICT DO NOTHING
+                            """,
+                            (target["id"], source["id"]),
+                        )
+                        cur.execute("DELETE FROM tags WHERE id = %s", (source["id"],))
+                        cur.execute("UPDATE tags SET user_defined = true WHERE id = %s", (target["id"],))
+                        target_id = target["id"]
+                        final_norm = target["normalized"]
+                    else:
+                        cur.execute(
+                            "UPDATE tags SET name = %s, normalized = %s, user_defined = true WHERE id = %s",
+                            (new_name, new_norm, source["id"]),
+                        )
+                        target_id = source["id"]
+                        final_norm = new_norm
+
+            if has_color:
+                cur.execute("UPDATE tags SET color = %s WHERE id = %s", (new_color, target_id))
+
+    summary = tag_summary_by_norm(final_norm)
+    if summary is None:
+        raise HTTPException(404, "Tag not found")
+    return summary
+
+
+def delete_tag_definition(tag: str) -> None:
+    ensure_db_ready()
+    norm = normalize_tag(tag)
+    with db_connect(row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    t.id,
+                    t.name,
+                    t.normalized,
+                    COUNT(DISTINCT CASE WHEN it.kind = 'auto' THEN it.image_id END) AS auto_count
+                FROM tags t
+                LEFT JOIN image_tags it ON it.tag_id = t.id
+                WHERE t.normalized = %s
+                GROUP BY t.id
+                """,
+                (norm,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise HTTPException(404, "Tag not found")
+            if int(row["auto_count"] or 0) > 0:
+                cur.execute(
+                    """
+                    INSERT INTO suppressed_auto_tags (normalized, name)
+                    VALUES (%s, %s)
+                    ON CONFLICT (normalized) DO UPDATE SET name = EXCLUDED.name
+                    """,
+                    (row["normalized"], row["name"]),
+                )
+            cur.execute("DELETE FROM tags WHERE id = %s", (row["id"],))
+
+
+def replace_image_user_tags(image_id: str, tags: list[str]) -> None:
+    ensure_db_ready()
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            replace_image_tags(cur, image_id, tags, "user")
+
+
 def replace_image_tags(cur, image_id: str, tags: list[str], kind: str) -> None:
     cleaned = clean_tag_list(tags)
     if kind == "auto":
@@ -608,3 +777,26 @@ def mark_images_hidden_for_root(cur, root_path: str) -> None:
 def fetch_existing_images_map(cur, root_path: str) -> dict[str, str]:
     cur.execute("SELECT path, id FROM images WHERE root_path = %s", (root_path,))
     return {path: image_id for path, image_id in cur.fetchall()}
+
+
+def list_thumb_rebuild_rows(root_paths: list[str], *, limit: Optional[int]) -> list[dict[str, Any]]:
+    roots = [str(root) for root in root_paths if root]
+    if not roots:
+        return []
+    ensure_db_ready()
+    max_rows = 0 if limit is None else max(0, min(int(limit), 200000))
+
+    with db_connect(row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            sql = """
+                SELECT id, root_path, path, thumb, mtime
+                FROM images
+                WHERE root_path = ANY(%s) AND hidden = false
+                ORDER BY root_path, lower(path), path
+            """
+            params: list[Any] = [roots]
+            if max_rows > 0:
+                sql += " LIMIT %s"
+                params.append(max_rows)
+            cur.execute(sql, params)
+            return list(cur.fetchall())
