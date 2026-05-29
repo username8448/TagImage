@@ -134,30 +134,38 @@ IMGVIEWER_INLINE_WORKER=0 python run.py
 
 Отдельный Rust-воркер для `thumb` задач находится в `rust/thumb-worker`.
 
-Запуск:
+Обычный запуск теперь через основной launcher:
 
 ```bash
-./worker-rust-thumb.sh
+./start.sh start --build-rust --strict-rust
+# или
+IMGVIEWER_THUMB_JOB_MODE=queue ./start.sh start
 ```
 
-Нужен установленный Rust toolchain (`cargo`).
+`worker-rust-thumb.sh` оставлен как ручной debug helper для запуска только Rust thumb worker.
 
 ## Unified Launcher (non-Docker)
 
-Для веб-приложения используйте единый launcher:
+Основной launcher проекта:
 
 ```bash
-./start-webapp.sh start
-./start-webapp.sh status
-./start-webapp.sh restart
-./start-webapp.sh stop
+./start.sh
+./start.sh /path/to/images
+./start.sh start
+./start.sh stop
+./start.sh restart
+./start.sh status
+./start.sh logs
+./start.sh logs api
+./start.sh logs rescan
+./start.sh logs thumb
+./start.sh foreground
 ```
 
-Дополнительно:
+Проверка Rust thumbnails в строгом режиме:
 
 ```bash
-./start-webapp.sh start --build-rust
-./start-webapp.sh start --rust-bin-path /abs/path/imgviewer-thumb-worker
+./start.sh start --build-rust --strict-rust
 ```
 
 Скрипт поднимает:
@@ -167,6 +175,8 @@ IMGVIEWER_INLINE_WORKER=0 python run.py
 - Rust thumb worker (в режиме `IMGVIEWER_THUMB_JOB_MODE=queue`, если доступен бинарник/cargo)
 
 Логи: `.logs/`, pid-файлы: `.run/`.
+
+`start-webapp.sh` теперь deprecated compatibility wrapper, который просто прокидывает аргументы в `./start.sh`.
 
 ## Runtime env
 

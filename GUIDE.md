@@ -34,9 +34,29 @@ python run.py /home/user/Pictures
 ./start.sh
 ./start.sh /home/user/Pictures
 ./start.sh /home/user/Pictures --port 9000
+./start.sh status
+./start.sh stop
+./start.sh restart
+./start.sh logs
 ```
 
 При запуске с аргументом папка открывается сразу. Без аргумента путь можно указать в интерфейсе.
+
+Режим foreground (совместимость со старым простым запуском):
+
+```bash
+./start.sh foreground
+./start.sh foreground /home/user/Pictures
+```
+
+Проверка Rust thumbnails в строгом режиме:
+
+```bash
+./start.sh start --build-rust --strict-rust
+```
+
+`start-webapp.sh` оставлен как deprecated compatibility wrapper на `./start.sh`.
+`worker-rust-thumb.sh` оставлен как ручной debug helper для отдельного запуска Rust thumb worker.
 
 ## 3. Сканирование
 
