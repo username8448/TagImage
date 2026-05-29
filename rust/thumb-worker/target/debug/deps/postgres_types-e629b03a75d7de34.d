@@ -1,0 +1,10 @@
+/home/user/data/development/my-projects/test/TagImage/rust/thumb-worker/target/debug/deps/postgres_types-e629b03a75d7de34.d: /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/postgres-types-0.2.13/src/lib.rs /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/postgres-types-0.2.13/src/serde_json_1.rs /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/postgres-types-0.2.13/src/pg_lsn.rs /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/postgres-types-0.2.13/src/private.rs /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/postgres-types-0.2.13/src/special.rs /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/postgres-types-0.2.13/src/type_gen.rs
+
+/home/user/data/development/my-projects/test/TagImage/rust/thumb-worker/target/debug/deps/libpostgres_types-e629b03a75d7de34.rmeta: /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/postgres-types-0.2.13/src/lib.rs /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/postgres-types-0.2.13/src/serde_json_1.rs /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/postgres-types-0.2.13/src/pg_lsn.rs /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/postgres-types-0.2.13/src/private.rs /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/postgres-types-0.2.13/src/special.rs /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/postgres-types-0.2.13/src/type_gen.rs
+
+/home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/postgres-types-0.2.13/src/lib.rs:
+/home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/postgres-types-0.2.13/src/serde_json_1.rs:
+/home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/postgres-types-0.2.13/src/pg_lsn.rs:
+/home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/postgres-types-0.2.13/src/private.rs:
+/home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/postgres-types-0.2.13/src/special.rs:
+/home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/postgres-types-0.2.13/src/type_gen.rs:
