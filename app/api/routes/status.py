@@ -14,6 +14,7 @@ from ...config import (
 )
 from ...repo.db import count_jobs, db_health, list_jobs, serialize_job
 from ...services.app_state import get_roots, restore_root_from_session
+from ...services.worker_capabilities import get_worker_capabilities
 
 router = APIRouter()
 
@@ -70,6 +71,7 @@ def _status_workers_and_queues() -> dict[str, Any]:
         "workers": {
             "rescan_worker_expected": RESCAN_WORKER_EXPECTED,
             "thumb_worker_expected": THUMB_WORKER_EXPECTED,
+            "capabilities": get_worker_capabilities(),
         },
         "queues": {
             "rescan_queue_depth": rescan_queued,

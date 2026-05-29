@@ -12,7 +12,6 @@ from pydantic import BaseModel
 
 from ...config import (
     INDEX_DIR_NAME,
-    JOB_TYPE_THUMB,
     THUMB_JOB_MODE,
     THUMB_MAX_ATTEMPTS,
     THUMB_MAX_SIZE,
@@ -21,10 +20,10 @@ from ...config import (
     THUMB_WAIT_MS,
     THUMBS_DIR_NAME,
 )
-from ...repo.content import get_image_record, list_thumb_rebuild_rows
-from ...repo.db import enqueue_job
+from ...repo.content import get_image_record
 from ...services.app_state import require_root, require_roots
 from ...services.scanner import make_thumb_sync
+from ...services.thumbnail_jobs_service import enqueue_thumb_job, enqueue_thumb_rebuild_jobs
 
 router = APIRouter()
 
@@ -87,20 +86,15 @@ async def get_thumb(img_id: str):
 
     if THUMB_JOB_MODE == "queue":
         mtime = int(image["mtime"] or int(orig.stat().st_mtime))
-        dedupe_key = f"thumb:{img_id}:{mtime}"
-        job = enqueue_job(
-            JOB_TYPE_THUMB,
-            {
-                "image_id": img_id,
-                "root_path": str(root),
-                "path": image["path"],
-                "thumb": image["thumb"],
-                "mtime": mtime,
-                "max_size": [int(THUMB_MAX_SIZE[0]), int(THUMB_MAX_SIZE[1])],
-            },
+        job = enqueue_thumb_job(
+            image_id=img_id,
+            root_path=str(root),
+            path=image["path"],
+            thumb=image["thumb"],
+            mtime=mtime,
+            max_size=THUMB_MAX_SIZE,
             priority=30,
             max_attempts=THUMB_MAX_ATTEMPTS,
-            dedupe_key=dedupe_key,
         )
 
         if THUMB_WAIT_MS > 0:
@@ -168,43 +162,13 @@ async def get_thumb(img_id: str):
 @router.post("/api/thumbs/rebuild")
 async def enqueue_thumb_rebuild(req: ThumbRebuildRequest):
     roots = require_roots()
-    root_map = {str(root): root for root in roots}
-    rows = list_thumb_rebuild_rows(list(root_map), limit=req.limit)
+    result = enqueue_thumb_rebuild_jobs(
+        roots,
+        stale_only=req.stale_only,
+        limit=req.limit,
+        max_size=THUMB_MAX_SIZE,
+        priority=20,
+        max_attempts=THUMB_MAX_ATTEMPTS,
+    )
 
-    enqueued = 0
-    queued_existing = 0
-    skipped = 0
-    for row in rows:
-        root_str = row["root_path"]
-        root = root_map.get(root_str)
-        if root is None:
-            skipped += 1
-            continue
-        src = root / row["path"]
-        thumb = root / row["thumb"]
-        if req.stale_only:
-            if not src.exists():
-                skipped += 1
-                continue
-            if thumb.exists() and int(thumb.stat().st_mtime) >= int(row["mtime"] or 0):
-                skipped += 1
-                continue
-        job = enqueue_job(
-            JOB_TYPE_THUMB,
-            {
-                "image_id": row["id"],
-                "root_path": root_str,
-                "path": row["path"],
-                "thumb": row["thumb"],
-                "mtime": int(row["mtime"] or 0),
-                "max_size": [int(THUMB_MAX_SIZE[0]), int(THUMB_MAX_SIZE[1])],
-            },
-            priority=20,
-            max_attempts=THUMB_MAX_ATTEMPTS,
-            dedupe_key=f"thumb:{row['id']}:{int(row['mtime'] or 0)}",
-        )
-        if bool(job.get("__deduped")):
-            queued_existing += 1
-        enqueued += 1
-
-    return {"ok": True, "enqueued": enqueued, "queued_existing": queued_existing, "skipped": skipped, "total": len(rows)}
+    return {"ok": True, **result}

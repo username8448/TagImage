@@ -2,9 +2,14 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
-from ...config import JOB_STATE_RUNNING, JOB_TYPE_RESCAN, RESCAN_MAX_ATTEMPTS
-from ...repo.db import enqueue_job, get_job, list_jobs, serialize_job
+from ...config import RESCAN_MAX_ATTEMPTS
+from ...repo.db import get_job, list_jobs, serialize_job
 from ...services.app_state import require_roots
+from ...services.rescan_jobs_service import (
+    build_rescan_response,
+    enqueue_rescan_for_roots,
+    get_running_rescan_job,
+)
 
 router = APIRouter()
 
@@ -12,20 +17,12 @@ router = APIRouter()
 @router.post("/api/rescan")
 async def rescan():
     roots = require_roots()
-    running = list_jobs(job_type=JOB_TYPE_RESCAN, state=JOB_STATE_RUNNING, limit=1)
-    if running:
-        active = serialize_job(running[0])
-        return {"ok": False, "message": "Scan already running", "job_id": active["id"]}
+    running = get_running_rescan_job()
+    if running is not None:
+        return build_rescan_response(running_job=running)
 
-    jobs = [
-        enqueue_job(
-            JOB_TYPE_RESCAN,
-            {"root_path": str(root)},
-            max_attempts=RESCAN_MAX_ATTEMPTS,
-        )
-        for root in roots
-    ]
-    return {"ok": True, "job_id": jobs[0]["id"] if jobs else None, "job_ids": [job["id"] for job in jobs]}
+    jobs = enqueue_rescan_for_roots((str(root) for root in roots), max_attempts=RESCAN_MAX_ATTEMPTS)
+    return build_rescan_response(queued_jobs=jobs)
 
 
 @router.get("/api/jobs/{job_id}")

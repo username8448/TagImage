@@ -8,10 +8,9 @@ from typing import Any, Callable, Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from ...config import JOB_TYPE_RESCAN
 from ...repo.content import folder_tree_rows
-from ...repo.db import enqueue_job
 from ...services.app_state import get_roots, require_roots, set_root
+from ...services.rescan_jobs_service import enqueue_rescan_job
 
 router = APIRouter()
 
@@ -100,7 +99,7 @@ async def set_folder_endpoint(req: FolderRequest):
     except Exception as exc:
         raise HTTPException(500, f"Database error: {exc}")
 
-    job = enqueue_job(JOB_TYPE_RESCAN, {"root_path": str(root)})
+    job = enqueue_rescan_job(str(root))
     roots = [str(item) for item in get_roots()]
     return {"ok": True, "root": str(root), "root_paths": roots, "job_id": job["id"]}
 
