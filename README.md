@@ -211,3 +211,14 @@ npm run build:frontend
 ```
 
 `./start.sh` перед запуском backend проверяет наличие npm/node_modules и собирает frontend. Скрипт не запускает `npm install` автоматически: для офлайн-запуска зависимости должны быть установлены заранее.
+
+## Safe Tests
+
+Рекомендуемый запуск интеграционных тестов:
+
+```bash
+TEST_DATABASE_URL=postgresql://imgviewer:imgviewer@127.0.0.1:5432/tagimage_test pytest
+```
+
+Тесты поддерживают `TEST_DATABASE_URL` и в тестовом контексте используют его вместо обычного `DATABASE_URL`.
+Без `TEST_DATABASE_URL` включен безопасный fallback: интеграционные тесты восстанавливают `app_session` и чистят только test-данные (`/tmp/pytest-*`, `pytest-*`), чтобы не оставлять временные пути в рабочем состоянии приложения.

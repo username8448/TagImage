@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 use tokio_postgres::{Client, NoTls};
@@ -75,7 +76,7 @@ impl WorkerMetrics {
         self.slowest_ms = self.slowest_ms.max(total_ms);
     }
 
-    fn maybe_log_summary(&mut self, interval_sec: u64) {
+    fn maybe_log_summary(&mut self, interval_sec: u64, workers: usize) {
         if interval_sec == 0 {
             return;
         }
@@ -103,7 +104,8 @@ impl WorkerMetrics {
         };
 
         eprintln!(
-            "[rust-thumb-worker] metrics processed={} succeeded={} failed={} skipped={} avg_ms={} avg_render_ms={} thumbs_per_sec={:.2} slowest_ms={}",
+            "[rust-thumb-worker] metrics workers={} processed={} succeeded={} failed={} skipped={} avg_ms={} avg_render_ms={} thumbs_per_sec={:.2} slowest_ms={}",
+            workers,
             self.processed,
             self.succeeded,
             self.failed,
@@ -164,6 +166,14 @@ fn parse_u64_env(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn parse_usize_env(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
 fn ext_lower(source: &Path) -> String {
     source
         .extension()
@@ -181,6 +191,13 @@ fn fmt_opt_u64(value: Option<u64>) -> String {
 
 fn ms_to_u64(value: u128) -> u64 {
     value.min(u64::MAX as u128) as u64
+}
+
+fn lock_worker_metrics(metrics: &Arc<Mutex<WorkerMetrics>>) -> MutexGuard<'_, WorkerMetrics> {
+    match metrics.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 fn render_thumb(source: &Path, target: &Path, max_size: (u32, u32)) -> Result<(), String> {
@@ -436,43 +453,43 @@ fn process_payload(
     Ok((source, target, source_mtime, max_size, parsed.image_id))
 }
 
-async fn run() -> Result<(), String> {
-    let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://imgviewer:imgviewer@127.0.0.1:5432/imgviewer".to_string()
-    });
-    let poll_ms = std::env::var("IMGVIEWER_THUMB_WORKER_POLL_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(750)
-        .max(50);
-    let worker_id = std::env::var("IMGVIEWER_THUMB_WORKER_ID")
-        .unwrap_or_else(|_| format!("rust-thumb-{}", now_unix()));
-    let max_backoff_sec = std::env::var("IMGVIEWER_THUMB_MAX_BACKOFF_SEC")
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(300)
-        .max(1);
-    let metrics_interval_sec = parse_u64_env("IMGVIEWER_THUMB_METRICS_INTERVAL_SEC", 30);
-    let slow_ms = parse_u64_env("IMGVIEWER_THUMB_SLOW_MS", 1000) as u128;
-
+async fn run_worker_loop(
+    db_url: String,
+    worker_id: String,
+    slot: usize,
+    worker_count: usize,
+    poll_ms: u64,
+    max_backoff_sec: i64,
+    metrics_interval_sec: u64,
+    slow_ms: u128,
+    shared_metrics: Arc<Mutex<WorkerMetrics>>,
+) -> Result<(), String> {
     let (mut client, connection) = tokio_postgres::connect(&db_url, NoTls)
         .await
-        .map_err(|e| format!("connect postgres: {e}"))?;
+        .map_err(|e| format!("connect postgres (slot={}): {e}", slot))?;
 
+    let connection_worker_id = worker_id.clone();
     tokio::spawn(async move {
         if let Err(e) = connection.await {
-            eprintln!("[rust-thumb-worker] postgres connection error: {e}");
+            eprintln!(
+                "[rust-thumb-worker] postgres connection error worker={} slot={}: {e}",
+                connection_worker_id, slot
+            );
         }
     });
 
-    eprintln!("[rust-thumb-worker] started as {}", worker_id);
-
-    let mut worker_metrics = WorkerMetrics::new();
+    eprintln!(
+        "[rust-thumb-worker] loop_started worker={} slot={}",
+        worker_id, slot
+    );
 
     loop {
         let claimed = claim_next_thumb_job(&mut client, &worker_id).await?;
         let Some(job) = claimed else {
-            worker_metrics.maybe_log_summary(metrics_interval_sec);
+            {
+                let mut worker_metrics = lock_worker_metrics(&shared_metrics);
+                worker_metrics.maybe_log_summary(metrics_interval_sec, worker_count);
+            }
             sleep(Duration::from_millis(poll_ms)).await;
             continue;
         };
@@ -521,7 +538,9 @@ async fn run() -> Result<(), String> {
             Ok(job_metrics) => {
                 let image = job_metrics.image_id.as_deref().unwrap_or("unknown");
                 eprintln!(
-                    "[rust-thumb-worker] job_done job={} image={} ext={} total_ms={} render_ms={} source_bytes={} thumb_bytes={} skipped={}",
+                    "[rust-thumb-worker] job_done worker={} slot={} job={} image={} ext={} total_ms={} render_ms={} source_bytes={} thumb_bytes={} skipped={}",
+                    worker_id,
+                    slot,
                     job.id,
                     image,
                     job_metrics.ext,
@@ -534,39 +553,109 @@ async fn run() -> Result<(), String> {
 
                 if job_metrics.total_ms >= slow_ms {
                     eprintln!(
-                        "[rust-thumb-worker] slow_job job={} image={} ext={} total_ms={} render_ms={}",
-                        job.id, image, job_metrics.ext, job_metrics.total_ms, job_metrics.render_ms
+                        "[rust-thumb-worker] slow_job worker={} slot={} job={} image={} ext={} total_ms={} render_ms={}",
+                        worker_id,
+                        slot,
+                        job.id,
+                        image,
+                        job_metrics.ext,
+                        job_metrics.total_ms,
+                        job_metrics.render_ms
                     );
                 }
 
                 if let Err(e) = mark_succeeded(&mut client, &job, Some(&job_metrics)).await {
                     eprintln!(
-                        "[rust-thumb-worker] mark success failed for {}: {}",
-                        job.id, e
+                        "[rust-thumb-worker] mark success failed worker={} slot={} job={} error={}",
+                        worker_id, slot, job.id, e
                     );
                 }
 
-                worker_metrics.record_success(&job_metrics);
-                worker_metrics.maybe_log_summary(metrics_interval_sec);
+                {
+                    let mut worker_metrics = lock_worker_metrics(&shared_metrics);
+                    worker_metrics.record_success(&job_metrics);
+                    worker_metrics.maybe_log_summary(metrics_interval_sec, worker_count);
+                }
             }
             Err(err) => {
                 let total_ms = job_started.elapsed().as_millis();
                 eprintln!(
-                    "[rust-thumb-worker] job_failed job={} total_ms={} error={}",
-                    job.id, total_ms, err
+                    "[rust-thumb-worker] job_failed worker={} slot={} job={} total_ms={} error={}",
+                    worker_id, slot, job.id, total_ms, err
                 );
 
                 if let Err(e) =
                     mark_failed(&mut client, &job, &err, max_backoff_sec, Some(total_ms)).await
                 {
-                    eprintln!("[rust-thumb-worker] mark fail failed for {}: {}", job.id, e);
+                    eprintln!(
+                        "[rust-thumb-worker] mark fail failed worker={} slot={} job={} error={}",
+                        worker_id, slot, job.id, e
+                    );
                 }
 
-                worker_metrics.record_failure(total_ms);
-                worker_metrics.maybe_log_summary(metrics_interval_sec);
+                {
+                    let mut worker_metrics = lock_worker_metrics(&shared_metrics);
+                    worker_metrics.record_failure(total_ms);
+                    worker_metrics.maybe_log_summary(metrics_interval_sec, worker_count);
+                }
             }
         }
     }
+}
+
+async fn run() -> Result<(), String> {
+    let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgresql://imgviewer:imgviewer@127.0.0.1:5432/imgviewer".to_string()
+    });
+    let poll_ms = std::env::var("IMGVIEWER_THUMB_WORKER_POLL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(750)
+        .max(50);
+    let worker_id = std::env::var("IMGVIEWER_THUMB_WORKER_ID")
+        .unwrap_or_else(|_| format!("rust-thumb-{}", now_unix()));
+    let max_backoff_sec = std::env::var("IMGVIEWER_THUMB_MAX_BACKOFF_SEC")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(300)
+        .max(1);
+    let worker_count = parse_usize_env("IMGVIEWER_THUMB_WORKERS", 1);
+    let metrics_interval_sec = parse_u64_env("IMGVIEWER_THUMB_METRICS_INTERVAL_SEC", 30);
+    let slow_ms = parse_u64_env("IMGVIEWER_THUMB_SLOW_MS", 1000) as u128;
+
+    eprintln!(
+        "[rust-thumb-worker] started as {} workers={}",
+        worker_id, worker_count
+    );
+
+    let shared_metrics = Arc::new(Mutex::new(WorkerMetrics::new()));
+    let mut workers = tokio::task::JoinSet::new();
+
+    for slot in 1..=worker_count {
+        workers.spawn(run_worker_loop(
+            db_url.clone(),
+            worker_id.clone(),
+            slot,
+            worker_count,
+            poll_ms,
+            max_backoff_sec,
+            metrics_interval_sec,
+            slow_ms,
+            Arc::clone(&shared_metrics),
+        ));
+    }
+
+    while let Some(result) = workers.join_next().await {
+        match result {
+            Ok(Ok(())) => {
+                return Err("worker loop exited unexpectedly".to_string());
+            }
+            Ok(Err(err)) => return Err(err),
+            Err(err) => return Err(format!("worker loop join error: {err}")),
+        }
+    }
+
+    Err("all worker loops exited unexpectedly".to_string())
 }
 
 #[tokio::main]

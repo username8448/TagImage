@@ -297,8 +297,8 @@ def test_folder_picker_endpoint_uses_native_picker_result(client, monkeypatch):
 
 def test_scanner_does_not_create_auto_tags_and_keeps_manual_tags(client, tmp_path):
     root = tmp_path / f"tags-{uuid.uuid4().hex[:6]}"
-    trip_tag = f"Trips-{uuid.uuid4().hex[:6]}"
-    keep_tag = f"Keep-{uuid.uuid4().hex[:6]}"
+    trip_tag = f"pytest-trips-{uuid.uuid4().hex[:6]}"
+    keep_tag = f"pytest-keep-{uuid.uuid4().hex[:6]}"
     trip_file = root / trip_tag / "photo.jpg"
     keep_file = root / keep_tag / "photo.jpg"
     _write_tiny_jpeg(trip_file)
