@@ -35,6 +35,61 @@ DATABASE_URL=postgresql://imgviewer:imgviewer@127.0.0.1:5432/imgviewer
 
 Можно скопировать `.env.example` в `.env`; `start.sh` подхватит его автоматически.
 
+### Development DB options
+
+A) Docker PostgreSQL (optional dev tooling):
+
+```bash
+docker compose up -d postgres
+```
+
+B) Native local PostgreSQL (without Docker):
+
+```bash
+./scripts/local-postgres.sh init
+./scripts/local-postgres.sh start
+./scripts/local-postgres.sh url
+```
+
+Use `DATABASE_URL` in `.env` for the selected DB backend. Example for native mode:
+
+```bash
+DATABASE_URL=postgresql://imgviewer:imgviewer@127.0.0.1:55432/imgviewer
+```
+
+`.env` must not be committed.
+Docker is optional for development, and packaged Tauri runtime must not depend on Docker.
+
+### Database troubleshooting
+
+Быстрая диагностика:
+
+```bash
+./scripts/check-db.sh
+```
+
+Безопасное восстановление контейнера PostgreSQL (без удаления volume):
+
+```bash
+./scripts/repair-db.sh
+```
+
+Полезные команды:
+
+```bash
+docker compose up -d postgres
+./scripts/check-db.sh
+```
+
+`repair-db.sh` не удаляет volume и не выполняет `docker compose down -v`.
+`docker compose down -v` удаляет данные БД и должен запускаться только по явному решению пользователя.
+
+### Tauri direction note
+
+Текущий Docker/PostgreSQL путь нужен для разработки и тестов.
+Целевой packaged runtime для Tauri не должен зависеть от Docker.
+План и ограничения: `docs/tauri-migration-plan.md`.
+
 ## Возможности
 
 | Функция | Описание |

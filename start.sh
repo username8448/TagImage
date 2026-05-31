@@ -73,6 +73,7 @@ Examples:
 
 Env:
   IMGVIEWER_STARTUP_TIMEOUT_SEC  API readiness wait timeout in seconds (default: 20)
+  IMGVIEWER_DB_STARTUP_TIMEOUT_SEC  DB readiness wait timeout in seconds (default: 30)
 USAGE
 }
 
@@ -146,6 +147,47 @@ startup_timeout_sec() {
   fi
   warn "[start] invalid IMGVIEWER_STARTUP_TIMEOUT_SEC=$timeout, using 20"
   echo "20"
+}
+
+db_startup_timeout_sec() {
+  local timeout="${IMGVIEWER_DB_STARTUP_TIMEOUT_SEC:-30}"
+  if [[ "$timeout" =~ ^[0-9]+$ ]] && [[ "$timeout" -gt 0 ]]; then
+    echo "$timeout"
+    return 0
+  fi
+  warn "[start] invalid IMGVIEWER_DB_STARTUP_TIMEOUT_SEC=$timeout, using 30"
+  echo "30"
+}
+
+db_ready_once() {
+  "$PYTHON_BIN" - <<'PY' >/dev/null 2>&1
+import psycopg
+from app.config import DATABASE_URL
+
+with psycopg.connect(DATABASE_URL, connect_timeout=2) as conn:
+    with conn.cursor() as cur:
+        cur.execute("select 1")
+        cur.fetchone()
+PY
+}
+
+wait_for_db_ready() {
+  local timeout_sec="$1"
+  local elapsed=0
+
+  while [[ "$elapsed" -lt "$timeout_sec" ]]; do
+    if db_ready_once; then
+      echo "[db] ready"
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  echo "[db] not ready (timeout: ${timeout_sec}s)"
+  echo "Try: ./scripts/check-db.sh"
+  echo "Try: ./scripts/repair-db.sh"
+  return 1
 }
 
 api_health_ready_once() {
@@ -656,12 +698,18 @@ show_logs() {
 start_background() {
   mkdir -p "$RUN_DIR" "$LOG_DIR"
   local timeout_sec
+  local db_timeout_sec
 
   apply_strict_rust_if_requested
   prepare_runtime_dependencies
   validate_folder
   ensure_port_available
   build_rust_if_requested
+
+  db_timeout_sec="$(db_startup_timeout_sec)"
+  if ! wait_for_db_ready "$db_timeout_sec"; then
+    exit 1
+  fi
 
   start_api_process
   start_rescan_worker_process
@@ -706,10 +754,17 @@ start_background() {
 }
 
 start_foreground() {
+  local db_timeout_sec
+
   apply_strict_rust_if_requested
   prepare_runtime_dependencies
   validate_folder
   ensure_port_available
+
+  db_timeout_sec="$(db_startup_timeout_sec)"
+  if ! wait_for_db_ready "$db_timeout_sec"; then
+    exit 1
+  fi
 
   local url="http://127.0.0.1:$PORT"
   echo ""
