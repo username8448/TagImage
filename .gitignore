@@ -4,7 +4,10 @@ static/app.js
 
 __pycache__/
 *.py[cod]
+*.log
 
 .venv/
 .run/
 .logs/
+target/
+rust/**/target/
