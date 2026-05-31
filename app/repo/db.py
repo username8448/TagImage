@@ -18,6 +18,7 @@ from ..config import (
     RESCAN_MAX_BACKOFF_SEC,
     THUMB_MAX_BACKOFF_SEC,
     VALID_JOB_STATES,
+    job_stale_running_sec,
 )
 
 try:
@@ -527,6 +528,35 @@ def count_jobs(*, job_type: Optional[str] = None, state: Optional[str] = None) -
             return int(row[0] if row else 0)
 
 
+def count_stale_running_jobs(
+    *, job_type: Optional[str] = None, stale_after_sec: Optional[int] = None
+) -> int:
+    stale_sec = job_stale_running_sec() if stale_after_sec is None else int(stale_after_sec)
+    if stale_sec <= 0:
+        return 0
+
+    ensure_db_ready()
+    where = [
+        "state = %s",
+        """
+        GREATEST(
+            COALESCE(started_at, created_at, '-infinity'::timestamptz),
+            COALESCE(updated_at, started_at, created_at, '-infinity'::timestamptz)
+        ) <= now() - (%s * INTERVAL '1 second')
+        """,
+    ]
+    params: list[Any] = [JOB_STATE_RUNNING, stale_sec]
+    if job_type:
+        where.append("job_type = %s")
+        params.append(job_type)
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM jobs WHERE " + " AND ".join(where), params)
+            row = cur.fetchone()
+            return int(row[0] if row else 0)
+
+
 def find_active_job_by_dedupe(job_type: str, dedupe_key: str) -> Optional[dict[str, Any]]:
     ensure_db_ready()
     with db_connect(row_factory=dict_row) as conn:
@@ -773,6 +803,133 @@ def mark_job_failed(job_id: str, error: str) -> None:
         except Exception:
             conn.rollback()
             raise
+
+
+def recover_stale_running_jobs(
+    *, stale_after_sec: Optional[int] = None, limit: int = 100
+) -> dict[str, Any]:
+    stale_sec = job_stale_running_sec() if stale_after_sec is None else int(stale_after_sec)
+    if stale_sec <= 0:
+        return {"disabled": True, "checked": 0, "recovered": 0, "requeued": 0, "failed": 0}
+
+    ensure_db_ready()
+    checked = 0
+    requeued = 0
+    failed = 0
+    capped_limit = max(1, min(int(limit), 500))
+
+    with db_connect(row_factory=dict_row, autocommit=False) as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    WITH stale AS (
+                        SELECT *,
+                               GREATEST(
+                                   COALESCE(started_at, created_at, '-infinity'::timestamptz),
+                                   COALESCE(updated_at, started_at, created_at, '-infinity'::timestamptz)
+                               ) AS last_activity_at
+                        FROM jobs
+                        WHERE state = %s
+                          AND GREATEST(
+                              COALESCE(started_at, created_at, '-infinity'::timestamptz),
+                              COALESCE(updated_at, started_at, created_at, '-infinity'::timestamptz)
+                          ) <= now() - (%s * INTERVAL '1 second')
+                        ORDER BY updated_at NULLS FIRST, started_at NULLS FIRST, created_at
+                        LIMIT %s
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    SELECT *,
+                           EXTRACT(EPOCH FROM (now() - last_activity_at))::bigint AS age_sec
+                    FROM stale
+                    """,
+                    (JOB_STATE_RUNNING, stale_sec, capped_limit),
+                )
+                stale_jobs = list(cur.fetchall())
+                checked = len(stale_jobs)
+
+                for job in stale_jobs:
+                    job_id = job["id"]
+                    job_type = job.get("job_type") or "unknown"
+                    previous_worker = job.get("worker_id")
+                    attempt = int(job.get("attempt") or 0)
+                    max_attempts = int(job.get("max_attempts") or 1)
+                    age_sec = int(job.get("age_sec") or 0)
+
+                    if attempt < max_attempts:
+                        next_state = JOB_STATE_QUEUED
+                        error = "stale running job recovered"
+                        event_name = "recovered"
+                        cur.execute(
+                            """
+                            UPDATE jobs
+                            SET state = %s,
+                                scheduled_at = now(),
+                                worker_id = NULL,
+                                error = %s,
+                                updated_at = now()
+                            WHERE id = %s
+                              AND state = %s
+                            """,
+                            (next_state, error, job_id, JOB_STATE_RUNNING),
+                        )
+                        requeued += cur.rowcount
+                    else:
+                        next_state = JOB_STATE_FAILED
+                        error = "stale running job exceeded max attempts"
+                        event_name = "recovered_failed"
+                        cur.execute(
+                            """
+                            UPDATE jobs
+                            SET state = %s,
+                                error = %s,
+                                finished_at = now(),
+                                updated_at = now()
+                            WHERE id = %s
+                              AND state = %s
+                            """,
+                            (next_state, error, job_id, JOB_STATE_RUNNING),
+                        )
+                        failed += cur.rowcount
+
+                    if cur.rowcount <= 0:
+                        continue
+
+                    _set_last_attempt_state(cur, job_id, next_state, error)
+                    event_data = {
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                        "previous_worker": previous_worker,
+                        "age_sec": age_sec,
+                        "stale_after_sec": stale_sec,
+                        "next_state": next_state,
+                    }
+                    cur.execute(
+                        """
+                        INSERT INTO job_events (job_id, event, data)
+                        VALUES (%s, %s, %s)
+                        """,
+                        (job_id, event_name, Jsonb(event_data) if Jsonb is not None else event_data),
+                    )
+                    print(
+                        "[jobs] recovered stale job "
+                        f"id={job_id} type={job_type} previous_worker={previous_worker} "
+                        f"age_sec={age_sec} next_state={next_state}",
+                        flush=True,
+                    )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    recovered = requeued + failed
+    return {
+        "disabled": False,
+        "checked": checked,
+        "recovered": recovered,
+        "requeued": requeued,
+        "failed": failed,
+    }
 
 
 def cleanup_old_jobs(*, ttl_hours: Optional[int] = None) -> dict[str, int]:

@@ -376,6 +376,7 @@ async fn mark_failed(
         .transaction()
         .await
         .map_err(|e| format!("begin tx fail: {e}"))?;
+    let error_text = error.to_string();
 
     let retries_left = (job.max_attempts - job.attempt).max(0);
     let (next_state, event_name, backoff) = if retries_left > 0 {
@@ -386,18 +387,20 @@ async fn mark_failed(
     } else {
         ("failed", "failed", 0)
     };
+    let next_state_text = next_state.to_string();
+    let event_name_text = event_name.to_string();
 
     if next_state == "queued" {
         tx.execute(
-            "UPDATE jobs SET state = 'queued', error = $2, scheduled_at = now() + ($3 * INTERVAL '1 second'), worker_id = NULL, updated_at = now() WHERE id = $1",
-            &[&job.id, &error, &backoff],
+            "UPDATE jobs SET state = 'queued', error = $2, scheduled_at = now() + ($3::bigint * INTERVAL '1 second'), worker_id = NULL, updated_at = now() WHERE id = $1",
+            &[&job.id, &error_text, &backoff],
         )
         .await
         .map_err(|e| format!("update retry: {e}"))?;
     } else {
         tx.execute(
             "UPDATE jobs SET state = 'failed', error = $2, finished_at = now(), updated_at = now() WHERE id = $1",
-            &[&job.id, &error],
+            &[&job.id, &error_text],
         )
         .await
         .map_err(|e| format!("update failed: {e}"))?;
@@ -415,7 +418,7 @@ async fn mark_failed(
             LIMIT 1
         )
         "#,
-        &[&job.id, &next_state, &error],
+        &[&job.id, &next_state_text, &error_text],
     )
     .await
     .map_err(|e| format!("update attempt fail: {e}"))?;
@@ -430,7 +433,7 @@ async fn mark_failed(
     });
     tx.execute(
         "INSERT INTO job_events (job_id, event, data) VALUES ($1, $2, $3)",
-        &[&job.id, &event_name, &event_data],
+        &[&job.id, &event_name_text, &event_data],
     )
     .await
     .map_err(|e| format!("insert fail event: {e}"))?;

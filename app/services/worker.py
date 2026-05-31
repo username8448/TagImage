@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 
 from ..config import JOB_TYPE_RESCAN
-from ..repo.db import claim_next_job, ensure_db_ready, mark_job_failed
+from ..repo.db import claim_next_job, ensure_db_ready, mark_job_failed, recover_stale_running_jobs
 from ..services.scanner import run_rescan_job
 
 
@@ -22,6 +22,7 @@ def process_job(job: dict) -> None:
 
 def worker_loop(*, poll_interval: float = 1.0, once: bool = False, worker_id: str) -> int:
     ensure_db_ready()
+    recover_stale_running_jobs()
     processed = 0
     while True:
         job = claim_next_job(worker_id, job_type=JOB_TYPE_RESCAN)

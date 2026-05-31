@@ -12,7 +12,7 @@ from ...config import (
     THUMB_JOB_MODE,
     THUMB_WORKER_EXPECTED,
 )
-from ...repo.db import count_jobs, db_health, list_jobs, serialize_job
+from ...repo.db import count_jobs, count_stale_running_jobs, db_health, list_jobs, serialize_job
 from ...services.app_state import get_roots, restore_root_from_session
 from ...services.worker_capabilities import get_worker_capabilities
 
@@ -65,8 +65,11 @@ def _rescan_status() -> dict[str, Any]:
 def _status_workers_and_queues() -> dict[str, Any]:
     thumb_running = count_jobs(job_type=JOB_TYPE_THUMB, state=JOB_STATE_RUNNING)
     thumb_queued = count_jobs(job_type=JOB_TYPE_THUMB, state=JOB_STATE_QUEUED)
+    thumb_stale_running = count_stale_running_jobs(job_type=JOB_TYPE_THUMB)
     rescan_running = count_jobs(job_type=JOB_TYPE_RESCAN, state=JOB_STATE_RUNNING)
     rescan_queued = count_jobs(job_type=JOB_TYPE_RESCAN, state=JOB_STATE_QUEUED)
+    rescan_stale_running = count_stale_running_jobs(job_type=JOB_TYPE_RESCAN)
+    stale_running = count_stale_running_jobs()
     return {
         "workers": {
             "rescan_worker_expected": RESCAN_WORKER_EXPECTED,
@@ -78,7 +81,10 @@ def _status_workers_and_queues() -> dict[str, Any]:
             "rescan_running": rescan_running,
             "thumb_queue_depth": thumb_queued,
             "thumb_running": thumb_running,
+            "thumb_stale_running": thumb_stale_running,
             "thumb_mode": THUMB_JOB_MODE,
+            "rescan_stale_running": rescan_stale_running,
+            "stale_running": stale_running,
             "degraded": bool(THUMB_WORKER_EXPECTED and THUMB_JOB_MODE == "queue" and thumb_running == 0 and thumb_queued > 0),
         },
     }

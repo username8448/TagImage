@@ -228,7 +228,7 @@ def configure_test_database() -> None:
 @pytest.fixture(autouse=True)
 def isolate_integration_db_state(request) -> Generator[None, None, None]:
     module_name = getattr(request.module, "__name__", "")
-    if not module_name.endswith("test_api_integration"):
+    if not (module_name.endswith("test_api_integration") or module_name.endswith("test_job_recovery")):
         yield
         return
 
