@@ -1,12 +1,12 @@
 use image::codecs::jpeg::JpegEncoder;
 use image::ColorType;
-use serde::Deserialize;
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tagimage_core::{parse_u64_env, parse_usize_env, ThumbJobPayload};
 use tokio::time::sleep;
 use tokio_postgres::{Client, NoTls};
 
@@ -118,16 +118,6 @@ impl WorkerMetrics {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ThumbPayload {
-    image_id: Option<String>,
-    root_path: String,
-    path: String,
-    thumb: String,
-    mtime: Option<i64>,
-    max_size: Option<Vec<u32>>,
-}
-
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -148,7 +138,7 @@ fn file_size(path: &Path) -> Option<u64> {
     fs::metadata(path).ok().map(|m| m.len())
 }
 
-fn parse_max_size(payload: &ThumbPayload) -> (u32, u32) {
+fn parse_max_size(payload: &ThumbJobPayload) -> (u32, u32) {
     if let Some(parts) = &payload.max_size {
         if parts.len() >= 2 {
             let w = parts[0].max(32);
@@ -157,21 +147,6 @@ fn parse_max_size(payload: &ThumbPayload) -> (u32, u32) {
         }
     }
     (640, 640)
-}
-
-fn parse_u64_env(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(default)
-}
-
-fn parse_usize_env(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(default)
 }
 
 fn ext_lower(source: &Path) -> String {
@@ -444,7 +419,7 @@ async fn mark_failed(
 fn process_payload(
     payload: Value,
 ) -> Result<(PathBuf, PathBuf, i64, (u32, u32), Option<String>), String> {
-    let parsed: ThumbPayload =
+    let parsed: ThumbJobPayload =
         serde_json::from_value(payload).map_err(|e| format!("invalid payload: {e}"))?;
     let source = Path::new(&parsed.root_path).join(&parsed.path);
     let target = Path::new(&parsed.root_path).join(&parsed.thumb);

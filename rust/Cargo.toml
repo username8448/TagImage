@@ -1,0 +1,6 @@
+[workspace]
+members = [
+  "thumb-worker",
+  "crates/tagimage-core",
+]
+resolver = "2"

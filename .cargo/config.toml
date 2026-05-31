@@ -1,0 +1,4 @@
+# Keep workspace builds using the historical thumb-worker target dir so
+# start.sh can continue to find the release binary at the existing path.
+[build]
+target-dir = "rust/thumb-worker/target"
