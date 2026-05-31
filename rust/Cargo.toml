@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "thumb-worker",
+  "metadata-worker",
   "crates/tagimage-core",
   "crates/tagimage-db",
 ]

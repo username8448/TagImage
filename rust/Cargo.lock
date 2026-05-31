@@ -586,6 +586,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40fac9d56ed6437b198fddba683305e8e2d651aa42647f00f5ae542e7f5c94a2"
 
 [[package]]
+name = "imgviewer-metadata-worker"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "serde_json",
+ "tagimage-core",
+ "tagimage-db",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "imgviewer-thumb-worker"
 version = "0.1.0"
 dependencies = [
