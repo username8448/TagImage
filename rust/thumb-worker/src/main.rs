@@ -7,16 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tagimage_core::{parse_u64_env, parse_usize_env, ThumbJobPayload};
+use tagimage_db::{claim_next_thumb_job, mark_thumb_failed, mark_thumb_succeeded};
 use tokio::time::sleep;
-use tokio_postgres::{Client, NoTls};
-
-#[derive(Debug, Clone)]
-struct ClaimedJob {
-    id: String,
-    attempt: i32,
-    max_attempts: i32,
-    payload: Value,
-}
+use tokio_postgres::NoTls;
 
 #[derive(Debug, Clone)]
 struct ThumbJobMetrics {
@@ -164,10 +157,6 @@ fn fmt_opt_u64(value: Option<u64>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn ms_to_u64(value: u128) -> u64 {
-    value.min(u64::MAX as u128) as u64
-}
-
 fn lock_worker_metrics(metrics: &Arc<Mutex<WorkerMetrics>>) -> MutexGuard<'_, WorkerMetrics> {
     match metrics.lock() {
         Ok(guard) => guard,
@@ -200,220 +189,6 @@ fn render_thumb(source: &Path, target: &Path, max_size: (u32, u32)) -> Result<()
         .flush()
         .map_err(|e| format!("flush thumb {}: {e}", target.display()))?;
     Ok(())
-}
-
-async fn claim_next_thumb_job(
-    client: &mut Client,
-    worker_id: &str,
-) -> Result<Option<ClaimedJob>, String> {
-    let tx = client
-        .transaction()
-        .await
-        .map_err(|e| format!("begin tx: {e}"))?;
-
-    let rows = tx
-        .query(
-            r#"
-            WITH picked AS (
-                SELECT j.id
-                FROM jobs j
-                WHERE j.state = 'queued'
-                  AND j.scheduled_at <= now()
-                  AND j.job_type = 'thumb'
-                ORDER BY j.priority DESC, j.scheduled_at, j.created_at
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-            )
-            UPDATE jobs j
-            SET state = 'running',
-                worker_id = $1,
-                started_at = COALESCE(j.started_at, now()),
-                attempt = j.attempt + 1,
-                progress_done = 0,
-                progress_total = GREATEST(j.progress_total, 1),
-                updated_at = now(),
-                error = NULL
-            FROM picked
-            WHERE j.id = picked.id
-            RETURNING j.id, j.attempt, j.max_attempts, j.payload
-            "#,
-            &[&worker_id],
-        )
-        .await
-        .map_err(|e| format!("claim update: {e}"))?;
-
-    if rows.is_empty() {
-        tx.rollback().await.map_err(|e| format!("rollback: {e}"))?;
-        return Ok(None);
-    }
-
-    let row = &rows[0];
-    let job_id: String = row.get("id");
-    let attempt: i32 = row.get("attempt");
-    let max_attempts: i32 = row.get("max_attempts");
-    let payload: Value = row.get("payload");
-
-    tx.execute(
-        "INSERT INTO job_attempts (job_id, attempt, worker_id, state) VALUES ($1, $2, $3, 'running')",
-        &[&job_id, &attempt, &worker_id],
-    )
-    .await
-    .map_err(|e| format!("insert attempt: {e}"))?;
-
-    let event_data = json!({"attempt": attempt, "worker_id": worker_id, "claimed_at": now_unix()});
-    tx.execute(
-        "INSERT INTO job_events (job_id, event, data) VALUES ($1, 'started', $2)",
-        &[&job_id, &event_data],
-    )
-    .await
-    .map_err(|e| format!("insert event: {e}"))?;
-
-    tx.commit()
-        .await
-        .map_err(|e| format!("commit claim: {e}"))?;
-
-    Ok(Some(ClaimedJob {
-        id: job_id,
-        attempt,
-        max_attempts,
-        payload,
-    }))
-}
-
-async fn mark_succeeded(
-    client: &mut Client,
-    job: &ClaimedJob,
-    metrics: Option<&ThumbJobMetrics>,
-) -> Result<(), String> {
-    let tx = client
-        .transaction()
-        .await
-        .map_err(|e| format!("begin tx succeed: {e}"))?;
-    tx.execute(
-        "UPDATE jobs SET state = 'succeeded', progress_done = 1, progress_total = GREATEST(progress_total, 1), finished_at = now(), error = NULL, updated_at = now() WHERE id = $1",
-        &[&job.id],
-    )
-    .await
-    .map_err(|e| format!("update succeed: {e}"))?;
-
-    tx.execute(
-        r#"
-        UPDATE job_attempts
-        SET finished_at = now(), state = 'succeeded', error = NULL
-        WHERE id = (
-            SELECT id
-            FROM job_attempts
-            WHERE job_id = $1
-            ORDER BY started_at DESC
-            LIMIT 1
-        )
-        "#,
-        &[&job.id],
-    )
-    .await
-    .map_err(|e| format!("update attempt succeed: {e}"))?;
-
-    let mut event_data = json!({"attempt": job.attempt, "completed_at": now_unix()});
-    if let Some(job_metrics) = metrics {
-        let metrics_data = json!({
-            "total_ms": ms_to_u64(job_metrics.total_ms),
-            "render_ms": ms_to_u64(job_metrics.render_ms),
-            "source_bytes": job_metrics.source_bytes,
-            "thumb_bytes": job_metrics.thumb_bytes,
-            "skipped_existing": job_metrics.skipped_existing,
-            "ext": job_metrics.ext,
-        });
-        if let Some(obj) = event_data.as_object_mut() {
-            obj.insert("metrics".to_string(), metrics_data);
-        }
-    }
-
-    tx.execute(
-        "INSERT INTO job_events (job_id, event, data) VALUES ($1, 'succeeded', $2)",
-        &[&job.id, &event_data],
-    )
-    .await
-    .map_err(|e| format!("insert success event: {e}"))?;
-
-    tx.commit()
-        .await
-        .map_err(|e| format!("commit succeed: {e}"))
-}
-
-async fn mark_failed(
-    client: &mut Client,
-    job: &ClaimedJob,
-    error: &str,
-    max_backoff_sec: i64,
-    total_ms: Option<u128>,
-) -> Result<(), String> {
-    let tx = client
-        .transaction()
-        .await
-        .map_err(|e| format!("begin tx fail: {e}"))?;
-    let error_text = error.to_string();
-
-    let retries_left = (job.max_attempts - job.attempt).max(0);
-    let (next_state, event_name, backoff) = if retries_left > 0 {
-        let secs = 2_i64
-            .pow(job.attempt.max(1) as u32)
-            .min(max_backoff_sec.max(1));
-        ("queued", "retry_scheduled", secs)
-    } else {
-        ("failed", "failed", 0)
-    };
-    let next_state_text = next_state.to_string();
-    let event_name_text = event_name.to_string();
-
-    if next_state == "queued" {
-        tx.execute(
-            "UPDATE jobs SET state = 'queued', error = $2, scheduled_at = now() + ($3::bigint * INTERVAL '1 second'), worker_id = NULL, updated_at = now() WHERE id = $1",
-            &[&job.id, &error_text, &backoff],
-        )
-        .await
-        .map_err(|e| format!("update retry: {e}"))?;
-    } else {
-        tx.execute(
-            "UPDATE jobs SET state = 'failed', error = $2, finished_at = now(), updated_at = now() WHERE id = $1",
-            &[&job.id, &error_text],
-        )
-        .await
-        .map_err(|e| format!("update failed: {e}"))?;
-    }
-
-    tx.execute(
-        r#"
-        UPDATE job_attempts
-        SET finished_at = now(), state = $2, error = $3
-        WHERE id = (
-            SELECT id
-            FROM job_attempts
-            WHERE job_id = $1
-            ORDER BY started_at DESC
-            LIMIT 1
-        )
-        "#,
-        &[&job.id, &next_state_text, &error_text],
-    )
-    .await
-    .map_err(|e| format!("update attempt fail: {e}"))?;
-
-    let event_data = json!({
-        "attempt": job.attempt,
-        "max_attempts": job.max_attempts,
-        "error": error,
-        "next_state": next_state,
-        "backoff": backoff,
-        "total_ms": total_ms.map(ms_to_u64),
-    });
-    tx.execute(
-        "INSERT INTO job_events (job_id, event, data) VALUES ($1, $2, $3)",
-        &[&job.id, &event_name_text, &event_data],
-    )
-    .await
-    .map_err(|e| format!("insert fail event: {e}"))?;
-
-    tx.commit().await.map_err(|e| format!("commit fail: {e}"))
 }
 
 fn process_payload(
@@ -542,7 +317,16 @@ async fn run_worker_loop(
                     );
                 }
 
-                if let Err(e) = mark_succeeded(&mut client, &job, Some(&job_metrics)).await {
+                let success_metrics = json!({
+                    "total_ms": job_metrics.total_ms.min(u64::MAX as u128) as u64,
+                    "render_ms": job_metrics.render_ms.min(u64::MAX as u128) as u64,
+                    "source_bytes": job_metrics.source_bytes,
+                    "thumb_bytes": job_metrics.thumb_bytes,
+                    "skipped_existing": job_metrics.skipped_existing,
+                    "ext": &job_metrics.ext,
+                });
+                if let Err(e) = mark_thumb_succeeded(&mut client, &job, Some(success_metrics)).await
+                {
                     eprintln!(
                         "[rust-thumb-worker] mark success failed worker={} slot={} job={} error={}",
                         worker_id, slot, job.id, e
@@ -563,7 +347,8 @@ async fn run_worker_loop(
                 );
 
                 if let Err(e) =
-                    mark_failed(&mut client, &job, &err, max_backoff_sec, Some(total_ms)).await
+                    mark_thumb_failed(&mut client, &job, &err, max_backoff_sec, Some(total_ms))
+                        .await
                 {
                     eprintln!(
                         "[rust-thumb-worker] mark fail failed worker={} slot={} job={} error={}",

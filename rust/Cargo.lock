@@ -593,6 +593,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tagimage-core",
+ "tagimage-db",
  "tokio",
  "tokio-postgres",
 ]
@@ -1363,6 +1364,15 @@ name = "tagimage-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "tagimage-db"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tagimage-core",
+ "tokio-postgres",
 ]
 
 [[package]]

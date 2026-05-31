@@ -1,0 +1,9 @@
+[package]
+name = "tagimage-db"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tagimage-core = { path = "../tagimage-core" }
+tokio-postgres = { version = "0.7.12", features = ["with-serde_json-1"] }
+serde_json = "1"
