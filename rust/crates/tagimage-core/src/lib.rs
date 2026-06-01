@@ -17,6 +17,11 @@ pub struct RescanJobPayload {
     pub root_path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScannerShadowJobPayload {
+    pub root_path: String,
+}
+
 /// Future contract for metadata jobs. Currently unused by workers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataJobPayload {
@@ -30,6 +35,7 @@ pub struct MetadataJobPayload {
 pub enum JobType {
     Thumb,
     Rescan,
+    ScannerShadow,
     Metadata,
     Hash,
     Index,

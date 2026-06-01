@@ -2,6 +2,7 @@
 members = [
   "thumb-worker",
   "metadata-worker",
+  "scanner-worker",
   "crates/tagimage-core",
   "crates/tagimage-db",
 ]

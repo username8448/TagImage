@@ -55,6 +55,7 @@ JOB_STATE_CANCELED = "canceled"
 JOB_TYPE_RESCAN = "rescan"
 JOB_TYPE_THUMB = "thumb"
 JOB_TYPE_INDEX = "index"
+JOB_TYPE_SCANNER_SHADOW = "scanner_shadow"
 
 VALID_MATCH_MODES = {"any", "all"}
 VALID_JOB_STATES = {

@@ -598,6 +598,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "imgviewer-scanner-worker"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "serde_json",
+ "tagimage-core",
+ "tagimage-db",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "imgviewer-thumb-worker"
 version = "0.1.0"
 dependencies = [

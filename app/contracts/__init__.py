@@ -5,6 +5,11 @@ from .metadata import (
     parse_metadata_payload,
 )
 from .rescan import RescanJobPayload, build_rescan_payload, parse_rescan_payload
+from .scanner_shadow import (
+    ScannerShadowJobPayload,
+    build_scanner_shadow_payload,
+    parse_scanner_shadow_payload,
+)
 from .thumbs import (
     ThumbJobPayload,
     build_thumb_payload,
@@ -20,6 +25,9 @@ __all__ = [
     "RescanJobPayload",
     "build_rescan_payload",
     "parse_rescan_payload",
+    "ScannerShadowJobPayload",
+    "build_scanner_shadow_payload",
+    "parse_scanner_shadow_payload",
     "MetadataJobPayload",
     "build_metadata_payload",
     "parse_metadata_payload",
