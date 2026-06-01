@@ -9,11 +9,13 @@ LOG_DIR="$SCRIPT_DIR/.logs"
 API_PID_FILE="$RUN_DIR/api.pid"
 RESCAN_PID_FILE="$RUN_DIR/rescan-worker.pid"
 THUMB_PID_FILE="$RUN_DIR/thumb-worker.pid"
+METADATA_PID_FILE="$RUN_DIR/metadata-worker.pid"
 PORT_FILE="$RUN_DIR/port"
 
 API_LOG="$LOG_DIR/api.log"
 RESCAN_LOG="$LOG_DIR/rescan-worker.log"
 THUMB_LOG="$LOG_DIR/thumb-worker.log"
+METADATA_LOG="$LOG_DIR/metadata-worker.log"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -40,6 +42,9 @@ VENV_DIR="$SCRIPT_DIR/.venv"
 THUMB_CMD_KIND=""
 THUMB_CMD_PATH=""
 THUMB_CMD_CARGO_DIR="$SCRIPT_DIR/rust/thumb-worker"
+METADATA_CMD_KIND=""
+METADATA_CMD_PATH=""
+METADATA_CMD_CARGO_DIR="$SCRIPT_DIR/rust/metadata-worker"
 
 usage() {
   cat <<'USAGE'
@@ -51,7 +56,7 @@ Usage:
   ./start.sh stop
   ./start.sh restart [path]
   ./start.sh status
-  ./start.sh logs [api|rescan|thumb]
+  ./start.sh logs [api|rescan|thumb|metadata]
   ./start.sh open
 
 Flags:
@@ -74,6 +79,7 @@ Examples:
 Env:
   IMGVIEWER_STARTUP_TIMEOUT_SEC  API readiness wait timeout in seconds (default: 20)
   IMGVIEWER_DB_STARTUP_TIMEOUT_SEC  DB readiness wait timeout in seconds (default: 30)
+  IMGVIEWER_METADATA_WORKER      Start Rust metadata-worker when set to 1
 USAGE
 }
 
@@ -157,6 +163,10 @@ db_startup_timeout_sec() {
   fi
   warn "[start] invalid IMGVIEWER_DB_STARTUP_TIMEOUT_SEC=$timeout, using 30"
   echo "30"
+}
+
+metadata_worker_enabled() {
+  [[ "${IMGVIEWER_METADATA_WORKER:-0}" == "1" ]]
 }
 
 db_ready_once() {
@@ -463,16 +473,29 @@ build_rust_if_requested() {
     return 0
   fi
 
-  if [[ -n "$RUST_BIN_PATH" ]]; then
-    return 0
+  local need_cargo=0
+  if [[ -z "$RUST_BIN_PATH" ]]; then
+    need_cargo=1
+  fi
+  if metadata_worker_enabled; then
+    need_cargo=1
   fi
 
-  if ! command -v cargo >/dev/null 2>&1; then
-    die "[thumb-worker] cargo not found; cannot build rust worker"
+  if [[ "$need_cargo" -eq 1 ]]; then
+    if ! command -v cargo >/dev/null 2>&1; then
+      die "[rust] cargo not found; cannot build rust workers"
+    fi
   fi
 
-  info "[thumb-worker] cargo build --release"
-  (cd "$SCRIPT_DIR/rust/thumb-worker" && cargo build --release)
+  if [[ -z "$RUST_BIN_PATH" ]]; then
+    info "[thumb-worker] cargo build --release"
+    (cd "$SCRIPT_DIR/rust/thumb-worker" && cargo build --release)
+  fi
+
+  if metadata_worker_enabled; then
+    info "[metadata-worker] cargo build --release"
+    (cd "$SCRIPT_DIR/rust/metadata-worker" && cargo build --release)
+  fi
 }
 
 resolve_thumb_command() {
@@ -517,6 +540,30 @@ resolve_thumb_command() {
   return 0
 }
 
+resolve_metadata_command() {
+  METADATA_CMD_KIND=""
+  METADATA_CMD_PATH=""
+
+  if ! metadata_worker_enabled; then
+    return 0
+  fi
+
+  local default_bin="$SCRIPT_DIR/rust/thumb-worker/target/release/imgviewer-metadata-worker"
+
+  if [[ -x "$default_bin" ]]; then
+    METADATA_CMD_KIND="bin"
+    METADATA_CMD_PATH="$default_bin"
+    return 0
+  fi
+
+  if command -v cargo >/dev/null 2>&1; then
+    METADATA_CMD_KIND="cargo"
+    return 0
+  fi
+
+  die "[metadata-worker] enabled but no rust worker binary/cargo available"
+}
+
 start_api_process() {
   if [[ -n "$FOLDER" ]]; then
     start_process "api" "$API_PID_FILE" "$API_LOG" "$SCRIPT_DIR" "$PYTHON_BIN" run.py "$FOLDER" --port "$PORT" --no-browser
@@ -558,7 +605,30 @@ start_thumb_worker_process() {
   esac
 }
 
+start_metadata_worker_process() {
+  if ! metadata_worker_enabled; then
+    return 0
+  fi
+
+  resolve_metadata_command
+
+  case "$METADATA_CMD_KIND" in
+    bin)
+      start_process "metadata-worker" "$METADATA_PID_FILE" "$METADATA_LOG" "$SCRIPT_DIR" "$METADATA_CMD_PATH"
+      ;;
+    cargo)
+      start_process "metadata-worker" "$METADATA_PID_FILE" "$METADATA_LOG" "$METADATA_CMD_CARGO_DIR" cargo run --release
+      ;;
+    *)
+      die "[metadata-worker] internal error: unknown command kind $METADATA_CMD_KIND"
+      ;;
+  esac
+}
+
 stop_all() {
+  if metadata_worker_enabled || [[ -f "$METADATA_PID_FILE" ]]; then
+    stop_process "metadata-worker" "$METADATA_PID_FILE"
+  fi
   stop_process "thumb-worker" "$THUMB_PID_FILE"
   stop_process "rescan-worker" "$RESCAN_PID_FILE"
   stop_process "api" "$API_PID_FILE"
@@ -625,6 +695,27 @@ verify_strict_thumb_worker_alive() {
   return 0
 }
 
+verify_metadata_worker_alive() {
+  local metadata_pid
+
+  if ! metadata_worker_enabled; then
+    return 0
+  fi
+
+  sleep 0.5
+  metadata_pid="$(read_pid "$METADATA_PID_FILE" || true)"
+  if [[ -z "${metadata_pid:-}" ]] || ! is_running_pid "$metadata_pid"; then
+    echo "[metadata-worker] exited after start"
+    echo "Tip: ./start.sh logs metadata"
+    if [[ -f "$METADATA_LOG" ]]; then
+      echo "----- last 40 lines of metadata-worker log -----"
+      tail -n 40 "$METADATA_LOG" || true
+    fi
+    return 1
+  fi
+  return 0
+}
+
 status_one() {
   local name="$1"
   local pid_file="$2"
@@ -646,6 +737,9 @@ status_all() {
   fi
   status_one "rescan-worker" "$RESCAN_PID_FILE" || true
   status_one "thumb-worker" "$THUMB_PID_FILE" || true
+  if metadata_worker_enabled || [[ -f "$METADATA_PID_FILE" ]]; then
+    status_one "metadata-worker" "$METADATA_PID_FILE" || true
+  fi
 
   if command -v curl >/dev/null 2>&1; then
     local health_url="http://127.0.0.1:${PORT}/api/status"
@@ -679,6 +773,9 @@ show_logs() {
       tail_log_file "api" "$API_LOG"
       tail_log_file "rescan-worker" "$RESCAN_LOG"
       tail_log_file "thumb-worker" "$THUMB_LOG"
+      if metadata_worker_enabled || [[ -f "$METADATA_LOG" ]]; then
+        tail_log_file "metadata-worker" "$METADATA_LOG"
+      fi
       ;;
     api)
       tail_log_file "api" "$API_LOG"
@@ -688,6 +785,9 @@ show_logs() {
       ;;
     thumb)
       tail_log_file "thumb-worker" "$THUMB_LOG"
+      ;;
+    metadata)
+      tail_log_file "metadata-worker" "$METADATA_LOG"
       ;;
     *)
       die "Unknown logs target: $LOG_TARGET"
@@ -728,6 +828,18 @@ start_background() {
 
   if ! verify_strict_thumb_worker_alive; then
     warn "[start] stopping started processes because strict-rust thumb-worker failed"
+    stop_all
+    exit 1
+  fi
+
+  if ! start_metadata_worker_process; then
+    warn "[start] stopping started processes because metadata-worker failed"
+    stop_all
+    exit 1
+  fi
+
+  if ! verify_metadata_worker_alive; then
+    warn "[start] stopping started processes because metadata-worker failed"
     stop_all
     exit 1
   fi
@@ -835,7 +947,7 @@ parse_args() {
         die "Command should be specified only once"
         ;;
       *)
-        if [[ "$ACTION" == "logs" && -z "$LOG_TARGET" && "$1" =~ ^(api|rescan|thumb)$ ]]; then
+        if [[ "$ACTION" == "logs" && -z "$LOG_TARGET" && "$1" =~ ^(api|rescan|thumb|metadata)$ ]]; then
           LOG_TARGET="$1"
           shift
           continue

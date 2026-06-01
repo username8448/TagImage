@@ -199,6 +199,17 @@ IMGVIEWER_THUMB_JOB_MODE=queue ./start.sh start
 
 `worker-rust-thumb.sh` оставлен как ручной debug helper для запуска только Rust thumb worker.
 
+### Rust metadata worker (manual shadow check)
+
+Для ручной проверки metadata jobs используйте:
+
+```bash
+.venv/bin/python scripts/enqueue-metadata-jobs.py --limit 20
+./scripts/run-metadata-worker.sh --timeout 30
+```
+
+`run-metadata-worker.sh` и `enqueue-metadata-jobs.py` загружают `.env`, поэтому используют тот же `DATABASE_URL`, что и `start.sh`.
+
 ## Unified Launcher (non-Docker)
 
 Основной launcher проекта:

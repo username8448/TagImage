@@ -4,6 +4,8 @@ from collections.abc import Generator
 
 import pytest
 
+from tagimage_env import ensure_database_url, load_env_file
+
 
 def detect_test_database() -> str | None:
     raw = os.getenv("TEST_DATABASE_URL", "").strip()
@@ -16,6 +18,27 @@ def db_is_test_safe(db_url: str | None) -> bool:
     lowered = db_url.lower()
     markers = ("test", "pytest", "tagimage_test")
     return any(marker in lowered for marker in markers)
+
+
+def configure_effective_database_url() -> None:
+    load_env_file()
+    test_db = detect_test_database()
+    if test_db:
+        if not db_is_test_safe(test_db):
+            pytest.exit(
+                "TEST_DATABASE_URL is set but looks unsafe. "
+                "Use a DB name/URL containing test/pytest/tagimage_test.",
+                returncode=2,
+            )
+        os.environ["DATABASE_URL"] = test_db
+        os.environ["TAGIMAGE_TEST_DB_ISOLATION"] = "test_db"
+        return
+
+    ensure_database_url()
+    os.environ.setdefault("TAGIMAGE_TEST_DB_ISOLATION", "fallback")
+
+
+configure_effective_database_url()
 
 
 def snapshot_app_session(cur):
@@ -211,7 +234,8 @@ def sanitize_app_session_paths(cur) -> None:
 def configure_test_database() -> None:
     test_db = detect_test_database()
     if not test_db:
-        os.environ.setdefault("TAGIMAGE_TEST_DB_ISOLATION", "fallback")
+        ensure_database_url()
+        os.environ["TAGIMAGE_TEST_DB_ISOLATION"] = "fallback"
         return
 
     if not db_is_test_safe(test_db):

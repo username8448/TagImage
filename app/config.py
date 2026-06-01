@@ -1,5 +1,9 @@
 import os
 
+from tagimage_env import ensure_database_url
+
+DATABASE_URL = ensure_database_url()
+
 SUPPORTED_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 INDEX_DIR_NAME = ".imgindex"
 THUMBS_DIR_NAME = "thumbs"
@@ -23,11 +27,6 @@ def _env_int(name: str, default: int, *, min_value: int = 0) -> int:
     except Exception:
         return default
     return max(min_value, value)
-
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://imgviewer:imgviewer@127.0.0.1:5432/imgviewer",
-)
 
 DEFAULT_PAGE_LIMIT = 120
 MAX_PAGE_LIMIT = 500
