@@ -4,23 +4,44 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tagimage_core::{parse_u64_env, ScannerShadowJobPayload};
+use tagimage_core::{parse_u64_env, RescanJobPayload, ScannerShadowJobPayload};
 use tagimage_db::{
-    claim_next_scanner_shadow_job, mark_scanner_shadow_failed, mark_scanner_shadow_succeeded,
+    claim_next_rescan_job, claim_next_scanner_shadow_job, mark_rescan_failed,
+    mark_rescan_succeeded, mark_scanner_shadow_failed, mark_scanner_shadow_succeeded,
+    touch_job_progress,
 };
 use tokio::time::sleep;
 use tokio_postgres::{Client, NoTls};
+use uuid::Uuid;
 
 const INDEX_DIR_NAME: &str = ".imgindex";
 const THUMBS_DIR_NAME: &str = "thumbs";
 const SCANNER_POLL_MS_DEFAULT: u64 = 750;
 const SCANNER_MAX_BACKOFF_SEC: i64 = 120;
+const THUMB_PRIORITY: i32 = 20;
+const THUMB_MAX_SIZE: [u32; 2] = [640, 640];
 
 #[derive(Debug, Clone)]
 struct ExistingImage {
     id: String,
     path: String,
     hidden: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerMode {
+    Shadow,
+    Authoritative,
+}
+
+#[derive(Debug, Clone)]
+struct ScannedImage {
+    rel: String,
+    ext: String,
+    source_bytes: i64,
+    mtime: i64,
+    width: i32,
+    height: i32,
 }
 
 fn now_unix() -> i64 {
@@ -30,6 +51,16 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+fn env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "y" | "on")
+        }
+        Err(_) => default,
+    }
+}
+
 fn parse_poll_ms() -> u64 {
     let parsed = parse_u64_env("IMGVIEWER_SCANNER_POLL_MS", SCANNER_POLL_MS_DEFAULT);
     if parsed == 0 {
@@ -37,6 +68,37 @@ fn parse_poll_ms() -> u64 {
     } else {
         parsed
     }
+}
+
+fn parse_i32_env(name: &str, default: i32, min_value: i32) -> i32 {
+    let parsed = std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .unwrap_or(default);
+    parsed.max(min_value)
+}
+
+fn worker_mode() -> WorkerMode {
+    if env_bool("IMGVIEWER_RUST_SCANNER", false) {
+        WorkerMode::Authoritative
+    } else {
+        WorkerMode::Shadow
+    }
+}
+
+fn thumb_queue_enabled() -> bool {
+    std::env::var("IMGVIEWER_THUMB_JOB_MODE")
+        .unwrap_or_else(|_| "sync".to_string())
+        .trim()
+        .eq_ignore_ascii_case("queue")
+}
+
+fn uuid_hex() -> String {
+    Uuid::new_v4().simple().to_string()
+}
+
+fn new_image_id() -> String {
+    uuid_hex().chars().take(12).collect()
 }
 
 fn supported_ext(path: &Path) -> bool {
@@ -212,6 +274,21 @@ fn image_dimensions_like_python(path: &Path) -> (u32, u32) {
         .unwrap_or((0, 0))
 }
 
+fn build_scanned_image(root: &Path, image_path: &Path) -> Result<ScannedImage, String> {
+    let rel = path_to_rel(root, image_path)?;
+    let meta = fs::metadata(image_path)
+        .map_err(|e| format!("read metadata {}: {e}", image_path.display()))?;
+    let (width, height) = image_dimensions_like_python(image_path);
+    Ok(ScannedImage {
+        rel,
+        ext: ext_lower(image_path),
+        source_bytes: meta.len().min(i64::MAX as u64) as i64,
+        mtime: file_mtime(&meta, image_path)?,
+        width: width.min(i32::MAX as u32) as i32,
+        height: height.min(i32::MAX as u32) as i32,
+    })
+}
+
 async fn load_existing_images(
     client: &Client,
     root_path: &str,
@@ -239,6 +316,237 @@ async fn load_existing_images(
     Ok(out)
 }
 
+async fn load_existing_image_ids(
+    client: &Client,
+    root_path: &str,
+) -> Result<HashMap<String, String>, String> {
+    let rows = client
+        .query(
+            "SELECT path, id FROM images WHERE root_path = $1",
+            &[&root_path],
+        )
+        .await
+        .map_err(|e| format!("query existing image ids: {e}"))?;
+
+    let mut out = HashMap::new();
+    for row in rows {
+        let path: String = row.get("path");
+        let id: String = row.get("id");
+        out.insert(path, id);
+    }
+    Ok(out)
+}
+
+async fn mark_images_hidden_for_root(client: &Client, root_path: &str) -> Result<(), String> {
+    client
+        .execute(
+            "UPDATE images SET hidden = true, updated_at = now() WHERE root_path = $1",
+            &[&root_path],
+        )
+        .await
+        .map_err(|e| format!("mark images hidden: {e}"))?;
+    Ok(())
+}
+
+async fn upsert_image_row(
+    client: &Client,
+    root_path: &str,
+    image: &ScannedImage,
+    image_id: &str,
+    thumb_rel: &str,
+) -> Result<String, String> {
+    let row = client
+        .query_one(
+            r#"
+            INSERT INTO images (
+                id, root_path, path, thumb, size, mtime, width, height, hidden
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false)
+            ON CONFLICT (root_path, path) DO UPDATE SET
+                thumb = EXCLUDED.thumb,
+                size = EXCLUDED.size,
+                mtime = EXCLUDED.mtime,
+                width = EXCLUDED.width,
+                height = EXCLUDED.height,
+                hidden = false,
+                updated_at = now()
+            RETURNING id
+            "#,
+            &[
+                &image_id,
+                &root_path,
+                &image.rel,
+                &thumb_rel,
+                &image.source_bytes,
+                &image.mtime,
+                &image.width,
+                &image.height,
+            ],
+        )
+        .await
+        .map_err(|e| format!("upsert image {}: {e}", image.rel))?;
+    Ok(row.get("id"))
+}
+
+async fn clear_auto_tags_for_image(client: &Client, image_id: &str) -> Result<(), String> {
+    client
+        .execute(
+            "DELETE FROM image_tags WHERE image_id = $1 AND kind = 'auto'",
+            &[&image_id],
+        )
+        .await
+        .map_err(|e| format!("clear auto tags for image {image_id}: {e}"))?;
+    Ok(())
+}
+
+async fn cleanup_hidden_image_tag_data(client: &Client) -> Result<(), String> {
+    client
+        .execute(
+            r#"
+            DELETE FROM image_tags it
+            USING images i
+            WHERE it.image_id = i.id
+              AND i.hidden = true
+            "#,
+            &[],
+        )
+        .await
+        .map_err(|e| format!("cleanup hidden image tags: {e}"))?;
+    client
+        .execute(
+            r#"
+            DELETE FROM tags t
+            WHERE t.user_defined = false
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM image_tags it
+                  WHERE it.tag_id = t.id
+              )
+            "#,
+            &[],
+        )
+        .await
+        .map_err(|e| format!("cleanup orphan auto tags: {e}"))?;
+    Ok(())
+}
+
+async fn enqueue_thumb_job(
+    client: &mut Client,
+    image_id: &str,
+    root_path: &str,
+    image: &ScannedImage,
+    thumb_rel: &str,
+) -> Result<bool, String> {
+    let dedupe_key = format!("thumb:{}:{}", image_id, image.mtime);
+    let max_attempts = parse_i32_env("IMGVIEWER_THUMB_MAX_ATTEMPTS", 5, 1);
+    let job_id = uuid_hex();
+    let payload = json!({
+        "image_id": image_id,
+        "root_path": root_path,
+        "path": image.rel,
+        "thumb": thumb_rel,
+        "mtime": image.mtime,
+        "max_size": THUMB_MAX_SIZE,
+    });
+
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| format!("begin thumb enqueue tx: {e}"))?;
+
+    let existing = tx
+        .query_opt(
+            r#"
+            SELECT id
+            FROM jobs
+            WHERE job_type = 'thumb'
+              AND dedupe_key = $1
+              AND state IN ('queued', 'running')
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+            &[&dedupe_key],
+        )
+        .await
+        .map_err(|e| format!("check thumb dedupe: {e}"))?;
+    if existing.is_some() {
+        tx.commit()
+            .await
+            .map_err(|e| format!("commit deduped thumb enqueue: {e}"))?;
+        return Ok(false);
+    }
+
+    let inserted = tx
+        .execute(
+            r#"
+            INSERT INTO jobs (id, job_type, payload, state, priority, max_attempts, scheduled_at, dedupe_key)
+            VALUES ($1, 'thumb', $2, 'queued', $3, $4, now(), $5)
+            "#,
+            &[&job_id, &payload, &THUMB_PRIORITY, &max_attempts, &dedupe_key],
+        )
+        .await;
+
+    if let Err(err) = inserted {
+        tx.rollback()
+            .await
+            .map_err(|e| format!("rollback failed thumb enqueue: {e}; insert error: {err}"))?;
+        let existing_after_race = client
+            .query_opt(
+                r#"
+                SELECT id
+                FROM jobs
+                WHERE job_type = 'thumb'
+                  AND dedupe_key = $1
+                  AND state IN ('queued', 'running')
+                ORDER BY created_at DESC
+                LIMIT 1
+                "#,
+                &[&dedupe_key],
+            )
+            .await
+            .map_err(|e| format!("check thumb dedupe after race: {e}"))?;
+        if existing_after_race.is_some() {
+            return Ok(false);
+        }
+        return Err(format!("insert thumb job: {err}"));
+    }
+
+    let event_data = json!({"job_type": "thumb"});
+    tx.execute(
+        "INSERT INTO job_events (job_id, event, data) VALUES ($1, 'enqueued', $2)",
+        &[&job_id, &event_data],
+    )
+    .await
+    .map_err(|e| format!("insert thumb enqueued event: {e}"))?;
+    tx.commit()
+        .await
+        .map_err(|e| format!("commit thumb enqueue: {e}"))?;
+    Ok(true)
+}
+
+async fn process_authoritative_image(
+    client: &mut Client,
+    root: &Path,
+    root_path: &str,
+    image: &ScannedImage,
+    existing_by_rel: &HashMap<String, String>,
+    queue_thumbs: bool,
+) -> Result<(), String> {
+    let image_id = existing_by_rel
+        .get(&image.rel)
+        .cloned()
+        .unwrap_or_else(new_image_id);
+    let thumb_rel = thumb_rel_for(&image_id);
+    let db_image_id = upsert_image_row(client, root_path, image, &image_id, &thumb_rel).await?;
+    clear_auto_tags_for_image(client, &db_image_id).await?;
+
+    if queue_thumbs && should_regenerate_thumb(image.mtime, &root.join(&thumb_rel)) {
+        enqueue_thumb_job(client, &db_image_id, root_path, image, &thumb_rel).await?;
+    }
+
+    Ok(())
+}
+
 async fn build_shadow_scan(client: &Client, payload: Value) -> Result<(Value, i32), String> {
     let parsed: ScannerShadowJobPayload =
         serde_json::from_value(payload).map_err(|e| format!("invalid scanner payload: {e}"))?;
@@ -253,34 +561,28 @@ async fn build_shadow_scan(client: &Client, payload: Value) -> Result<(Value, i3
     let mut thumb_job_candidates = Vec::new();
 
     for image_path in image_paths {
-        let rel = path_to_rel(&root, &image_path)?;
-        let meta = fs::metadata(&image_path)
-            .map_err(|e| format!("read metadata {}: {e}", image_path.display()))?;
-        let source_bytes = meta.len();
-        let mtime = file_mtime(&meta, &image_path)?;
-        let (width, height) = image_dimensions_like_python(&image_path);
-        let ext = ext_lower(&image_path);
-        let existing = existing_by_path.get(&rel);
+        let image = build_scanned_image(&root, &image_path)?;
+        let existing = existing_by_path.get(&image.rel);
         let existing_id = existing.map(|item| item.id.clone());
         let thumb_rel = existing_id.as_deref().map(thumb_rel_for);
         let thumb_job_candidate = if let Some(thumb) = thumb_rel.as_deref() {
-            should_regenerate_thumb(mtime, &root.join(thumb))
+            should_regenerate_thumb(image.mtime, &root.join(thumb))
         } else {
             true
         };
 
         if thumb_job_candidate {
-            thumb_job_candidates.push(rel.clone());
+            thumb_job_candidates.push(image.rel.clone());
         }
-        scanned_paths.insert(rel.clone());
-        paths.push(rel.clone());
+        scanned_paths.insert(image.rel.clone());
+        paths.push(image.rel.clone());
         images.push(json!({
-            "path": rel,
-            "ext": ext,
-            "source_bytes": source_bytes,
-            "mtime": mtime,
-            "width": width,
-            "height": height,
+            "path": image.rel,
+            "ext": image.ext,
+            "source_bytes": image.source_bytes,
+            "mtime": image.mtime,
+            "width": image.width,
+            "height": image.height,
             "existing_id": existing_id,
             "is_new": existing.is_none(),
             "thumb": thumb_rel,
@@ -319,9 +621,49 @@ async fn build_shadow_scan(client: &Client, payload: Value) -> Result<(Value, i3
     Ok((scan_json, total))
 }
 
+async fn run_authoritative_scan(
+    client: &mut Client,
+    payload: Value,
+    job_id: &str,
+) -> Result<i32, String> {
+    let parsed: RescanJobPayload =
+        serde_json::from_value(payload).map_err(|e| format!("invalid rescan payload: {e}"))?;
+    let root = PathBuf::from(&parsed.root_path);
+    let image_paths = scan_image_paths(&root)?;
+    let total = image_paths.len().min(i32::MAX as usize) as i32;
+    let queue_thumbs = thumb_queue_enabled();
+
+    touch_job_progress(client, job_id, 0, Some(total)).await?;
+    mark_images_hidden_for_root(client, &parsed.root_path).await?;
+    let existing_by_rel = load_existing_image_ids(client, &parsed.root_path).await?;
+
+    let mut done = 0_i32;
+    for image_path in image_paths {
+        let image = build_scanned_image(&root, &image_path)?;
+        process_authoritative_image(
+            client,
+            &root,
+            &parsed.root_path,
+            &image,
+            &existing_by_rel,
+            queue_thumbs,
+        )
+        .await?;
+
+        done = done.saturating_add(1);
+        if done % 20 == 0 || done == total {
+            touch_job_progress(client, job_id, done, Some(total)).await?;
+        }
+    }
+
+    cleanup_hidden_image_tag_data(client).await?;
+    Ok(total)
+}
+
 async fn run_worker_loop(
     db_url: String,
     worker_id: String,
+    mode: WorkerMode,
     poll_ms: u64,
     slow_ms: u128,
 ) -> Result<(), String> {
@@ -340,59 +682,103 @@ async fn run_worker_loop(
     });
 
     loop {
-        let claimed = claim_next_scanner_shadow_job(&mut client, &worker_id).await?;
+        let claimed = match mode {
+            WorkerMode::Shadow => claim_next_scanner_shadow_job(&mut client, &worker_id).await?,
+            WorkerMode::Authoritative => claim_next_rescan_job(&mut client, &worker_id).await?,
+        };
         let Some(job) = claimed else {
             sleep(Duration::from_millis(poll_ms)).await;
             continue;
         };
 
         let started_at = Instant::now();
-        match build_shadow_scan(&client, job.payload.clone()).await {
-            Ok((scan_json, total)) => {
-                let total_ms = started_at.elapsed().as_millis();
-                let root = scan_json
-                    .get("root_path")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                if let Err(e) =
-                    mark_scanner_shadow_succeeded(&mut client, &job, scan_json, total).await
-                {
+        match mode {
+            WorkerMode::Shadow => match build_shadow_scan(&client, job.payload.clone()).await {
+                Ok((scan_json, total)) => {
+                    let total_ms = started_at.elapsed().as_millis();
+                    let root = scan_json
+                        .get("root_path")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    if let Err(e) =
+                        mark_scanner_shadow_succeeded(&mut client, &job, scan_json, total).await
+                    {
+                        eprintln!(
+                            "[rust-scanner-worker] mark success failed worker={} job={} error={}",
+                            worker_id, job.id, e
+                        );
+                    }
                     eprintln!(
-                        "[rust-scanner-worker] mark success failed worker={} job={} error={}",
-                        worker_id, job.id, e
-                    );
-                }
-                eprintln!(
-                    "[rust-scanner-worker] job_done worker={} job={} root={} total={} total_ms={}",
-                    worker_id, job.id, root, total, total_ms
-                );
-                if total_ms >= slow_ms {
-                    eprintln!(
-                        "[rust-scanner-worker] slow_job worker={} job={} root={} total={} total_ms={}",
+                        "[rust-scanner-worker] job_done worker={} job={} root={} total={} total_ms={}",
                         worker_id, job.id, root, total, total_ms
                     );
+                    if total_ms >= slow_ms {
+                        eprintln!(
+                            "[rust-scanner-worker] slow_job worker={} job={} root={} total={} total_ms={}",
+                            worker_id, job.id, root, total, total_ms
+                        );
+                    }
                 }
-            }
-            Err(err) => {
-                let total_ms = started_at.elapsed().as_millis();
-                eprintln!(
-                    "[rust-scanner-worker] job_failed worker={} job={} total_ms={} error={}",
-                    worker_id, job.id, total_ms, err
-                );
-                if let Err(e) = mark_scanner_shadow_failed(
-                    &mut client,
-                    &job,
-                    &err,
-                    Some(total_ms),
-                    SCANNER_MAX_BACKOFF_SEC,
-                )
-                .await
-                {
+                Err(err) => {
+                    let total_ms = started_at.elapsed().as_millis();
                     eprintln!(
-                        "[rust-scanner-worker] mark fail failed worker={} job={} error={}",
-                        worker_id, job.id, e
+                        "[rust-scanner-worker] job_failed worker={} job={} total_ms={} error={}",
+                        worker_id, job.id, total_ms, err
                     );
+                    if let Err(e) = mark_scanner_shadow_failed(
+                        &mut client,
+                        &job,
+                        &err,
+                        Some(total_ms),
+                        SCANNER_MAX_BACKOFF_SEC,
+                    )
+                    .await
+                    {
+                        eprintln!(
+                            "[rust-scanner-worker] mark fail failed worker={} job={} error={}",
+                            worker_id, job.id, e
+                        );
+                    }
+                }
+            },
+            WorkerMode::Authoritative => {
+                match run_authoritative_scan(&mut client, job.payload.clone(), &job.id).await {
+                    Ok(total) => {
+                        let total_ms = started_at.elapsed().as_millis();
+                        if let Err(e) = mark_rescan_succeeded(&mut client, &job, total).await {
+                            eprintln!(
+                            "[rust-scanner-worker] mark rescan success failed worker={} job={} error={}",
+                            worker_id, job.id, e
+                        );
+                        }
+                        eprintln!(
+                        "[rust-scanner-worker] rescan_done worker={} job={} total={} total_ms={}",
+                        worker_id, job.id, total, total_ms
+                    );
+                        if total_ms >= slow_ms {
+                            eprintln!(
+                            "[rust-scanner-worker] slow_rescan worker={} job={} total={} total_ms={}",
+                            worker_id, job.id, total, total_ms
+                        );
+                        }
+                    }
+                    Err(err) => {
+                        let total_ms = started_at.elapsed().as_millis();
+                        eprintln!(
+                        "[rust-scanner-worker] rescan_failed worker={} job={} total_ms={} error={}",
+                        worker_id, job.id, total_ms, err
+                    );
+                        if let Err(e) =
+                            mark_rescan_failed(&mut client, &job, &err, SCANNER_MAX_BACKOFF_SEC)
+                                .await
+                        {
+                            eprintln!(
+                            "[rust-scanner-worker] mark rescan fail failed worker={} job={} error={}",
+                            worker_id, job.id, e
+                        );
+                        }
+                    }
                 }
             }
         }
@@ -403,12 +789,19 @@ async fn run() -> Result<(), String> {
     let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
         "postgresql://imgviewer:imgviewer@127.0.0.1:5432/imgviewer".to_string()
     });
-    let worker_id = format!("rust-scanner-shadow-{}", now_unix());
+    let mode = worker_mode();
+    let worker_id = match mode {
+        WorkerMode::Shadow => format!("rust-scanner-shadow-{}", now_unix()),
+        WorkerMode::Authoritative => format!("rust-scanner-rescan-{}", now_unix()),
+    };
     let poll_ms = parse_poll_ms();
     let slow_ms = parse_u64_env("IMGVIEWER_SCANNER_SLOW_MS", 2000) as u128;
 
-    eprintln!("[rust-scanner-worker] started as {}", worker_id);
-    run_worker_loop(db_url, worker_id, poll_ms, slow_ms).await
+    eprintln!(
+        "[rust-scanner-worker] started as {} mode={:?}",
+        worker_id, mode
+    );
+    run_worker_loop(db_url, worker_id, mode, poll_ms, slow_ms).await
 }
 
 #[tokio::main]

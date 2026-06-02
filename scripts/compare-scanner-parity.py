@@ -44,7 +44,7 @@ def maybe_reexec_venv(repo_root: Path) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare Python scanner reference vs Rust scanner shadow result")
     parser.add_argument("--root", default=None, help="folder to scan; defaults to saved active session root")
-    parser.add_argument("--timeout", type=float, default=30.0, help="seconds to wait for Rust scanner result")
+    parser.add_argument("--timeout", type=float, default=180.0, help="seconds to wait for Rust scanner result")
     parser.add_argument("--poll-interval", type=float, default=0.25, help="seconds between DB polls")
     parser.add_argument(
         "--no-start-worker",

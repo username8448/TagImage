@@ -7,13 +7,16 @@ cd "$SCRIPT_DIR"
 RUN_DIR="$SCRIPT_DIR/.run"
 LOG_DIR="$SCRIPT_DIR/.logs"
 API_PID_FILE="$RUN_DIR/api.pid"
+API_BACKEND_FILE="$RUN_DIR/api.backend"
 RESCAN_PID_FILE="$RUN_DIR/rescan-worker.pid"
+SCANNER_PID_FILE="$RUN_DIR/scanner-worker.pid"
 THUMB_PID_FILE="$RUN_DIR/thumb-worker.pid"
 METADATA_PID_FILE="$RUN_DIR/metadata-worker.pid"
 PORT_FILE="$RUN_DIR/port"
 
 API_LOG="$LOG_DIR/api.log"
 RESCAN_LOG="$LOG_DIR/rescan-worker.log"
+SCANNER_LOG="$LOG_DIR/scanner-worker.log"
 THUMB_LOG="$LOG_DIR/thumb-worker.log"
 METADATA_LOG="$LOG_DIR/metadata-worker.log"
 
@@ -42,6 +45,12 @@ VENV_DIR="$SCRIPT_DIR/.venv"
 THUMB_CMD_KIND=""
 THUMB_CMD_PATH=""
 THUMB_CMD_CARGO_DIR="$SCRIPT_DIR/rust/thumb-worker"
+API_CMD_KIND=""
+API_CMD_PATH=""
+API_CMD_CARGO_DIR="$SCRIPT_DIR/rust/api-server"
+SCANNER_CMD_KIND=""
+SCANNER_CMD_PATH=""
+SCANNER_CMD_CARGO_DIR="$SCRIPT_DIR/rust/scanner-worker"
 METADATA_CMD_KIND=""
 METADATA_CMD_PATH=""
 METADATA_CMD_CARGO_DIR="$SCRIPT_DIR/rust/metadata-worker"
@@ -56,13 +65,13 @@ Usage:
   ./start.sh stop
   ./start.sh restart [path]
   ./start.sh status
-  ./start.sh logs [api|rescan|thumb|metadata]
+  ./start.sh logs [api|rescan|scanner|thumb|metadata]
   ./start.sh open
 
 Flags:
   -p, --port <port>          API port (default: 8000 or PORT env)
       --no-open              Do not open browser
-      --build-rust           Build rust/thumb-worker with cargo build --release
+      --build-rust           Build enabled Rust components with cargo build --release
       --rust-bin-path <abs>  Use specific Rust thumb-worker binary
       --strict-rust          Enforce Rust-only thumbnails checks:
                              IMGVIEWER_THUMB_JOB_MODE=queue
@@ -79,7 +88,9 @@ Examples:
 Env:
   IMGVIEWER_STARTUP_TIMEOUT_SEC  API readiness wait timeout in seconds (default: 20)
   IMGVIEWER_DB_STARTUP_TIMEOUT_SEC  DB readiness wait timeout in seconds (default: 30)
+  IMGVIEWER_RUST_API            Run Rust api-server instead of Python FastAPI when set to 1
   IMGVIEWER_METADATA_WORKER      Start Rust metadata-worker when set to 1
+  IMGVIEWER_RUST_SCANNER         Run Rust scanner-worker for rescan jobs when set to 1
 USAGE
 }
 
@@ -167,6 +178,59 @@ db_startup_timeout_sec() {
 
 metadata_worker_enabled() {
   [[ "${IMGVIEWER_METADATA_WORKER:-0}" == "1" ]]
+}
+
+rust_api_enabled() {
+  [[ "${IMGVIEWER_RUST_API:-0}" == "1" ]]
+}
+
+api_backend_is_rust() {
+  if rust_api_enabled; then
+    return 0
+  fi
+
+  local api_pid
+  api_pid="$(read_pid "$API_PID_FILE" || true)"
+  if [[ -z "${api_pid:-}" ]] || ! is_running_pid "$api_pid"; then
+    return 1
+  fi
+
+  [[ -f "$API_BACKEND_FILE" ]] && [[ "$(cat "$API_BACKEND_FILE" 2>/dev/null || true)" == "rust" ]]
+}
+
+api_backend() {
+  if api_backend_is_rust; then
+    echo "rust"
+  else
+    echo "python"
+  fi
+}
+
+write_api_backend() {
+  mkdir -p "$RUN_DIR"
+  echo "$1" > "$API_BACKEND_FILE"
+}
+
+rust_scanner_enabled() {
+  [[ "${IMGVIEWER_RUST_SCANNER:-0}" == "1" ]]
+}
+
+scanner_backend_is_rust() {
+  if rust_scanner_enabled; then
+    return 0
+  fi
+
+  local scanner_pid
+  scanner_pid="$(read_pid "$SCANNER_PID_FILE" || true)"
+  [[ -n "${scanner_pid:-}" ]] && is_running_pid "$scanner_pid"
+}
+
+scanner_backend() {
+  if scanner_backend_is_rust; then
+    echo "rust"
+  else
+    echo "python"
+  fi
 }
 
 db_ready_once() {
@@ -468,6 +532,15 @@ apply_strict_rust_if_requested() {
   fi
 }
 
+apply_rust_scanner_if_requested() {
+  if rust_scanner_enabled; then
+    export IMGVIEWER_INLINE_WORKER=0
+    export IMGVIEWER_THUMB_JOB_MODE=queue
+    export IMGVIEWER_THUMB_WORKER_EXPECTED=1
+    ok "[scanner] rust backend enabled (thumb queue mode, inline worker off)"
+  fi
+}
+
 build_rust_if_requested() {
   if [[ "$BUILD_RUST" -ne 1 ]]; then
     return 0
@@ -478,6 +551,12 @@ build_rust_if_requested() {
     need_cargo=1
   fi
   if metadata_worker_enabled; then
+    need_cargo=1
+  fi
+  if rust_api_enabled; then
+    need_cargo=1
+  fi
+  if rust_scanner_enabled; then
     need_cargo=1
   fi
 
@@ -496,6 +575,40 @@ build_rust_if_requested() {
     info "[metadata-worker] cargo build --release"
     (cd "$SCRIPT_DIR/rust/metadata-worker" && cargo build --release)
   fi
+
+  if rust_api_enabled; then
+    info "[api-server] cargo build --release"
+    (cd "$SCRIPT_DIR/rust/api-server" && cargo build --release)
+  fi
+
+  if rust_scanner_enabled; then
+    info "[scanner-worker] cargo build --release"
+    (cd "$SCRIPT_DIR/rust/scanner-worker" && cargo build --release)
+  fi
+}
+
+resolve_api_command() {
+  API_CMD_KIND=""
+  API_CMD_PATH=""
+
+  if ! rust_api_enabled; then
+    return 0
+  fi
+
+  local default_bin="$SCRIPT_DIR/rust/thumb-worker/target/release/imgviewer-api-server"
+
+  if [[ -x "$default_bin" ]]; then
+    API_CMD_KIND="bin"
+    API_CMD_PATH="$default_bin"
+    return 0
+  fi
+
+  if command -v cargo >/dev/null 2>&1; then
+    API_CMD_KIND="cargo"
+    return 0
+  fi
+
+  die "[api] rust api enabled but no rust api-server binary/cargo available"
 }
 
 resolve_thumb_command() {
@@ -564,16 +677,117 @@ resolve_metadata_command() {
   die "[metadata-worker] enabled but no rust worker binary/cargo available"
 }
 
+resolve_scanner_command() {
+  SCANNER_CMD_KIND=""
+  SCANNER_CMD_PATH=""
+
+  if ! rust_scanner_enabled; then
+    return 0
+  fi
+
+  local default_bin="$SCRIPT_DIR/rust/thumb-worker/target/release/imgviewer-scanner-worker"
+
+  if [[ -x "$default_bin" ]]; then
+    SCANNER_CMD_KIND="bin"
+    SCANNER_CMD_PATH="$default_bin"
+    return 0
+  fi
+
+  if command -v cargo >/dev/null 2>&1; then
+    SCANNER_CMD_KIND="cargo"
+    return 0
+  fi
+
+  die "[scanner-worker] rust scanner enabled but no rust worker binary/cargo available"
+}
+
+set_start_folder_for_rust_api_if_needed() {
+  if ! rust_api_enabled || [[ -z "$FOLDER" ]]; then
+    return 0
+  fi
+
+  "$PYTHON_BIN" - "$FOLDER" <<'PY'
+import sys
+
+from app.services.app_state import get_roots, set_root
+from app.services.rescan_jobs_service import enqueue_rescan_job
+
+root = set_root(sys.argv[1])
+job = enqueue_rescan_job(str(root))
+roots = [str(item) for item in get_roots()]
+print(f"[api] rust startup root={root} roots={roots} rescan_job={job['id']}", flush=True)
+PY
+}
+
 start_api_process() {
+  if rust_api_enabled; then
+    set_start_folder_for_rust_api_if_needed
+    resolve_api_command
+
+    case "$API_CMD_KIND" in
+      bin)
+        if start_process "api" "$API_PID_FILE" "$API_LOG" "$SCRIPT_DIR" "$API_CMD_PATH" --host 0.0.0.0 --port "$PORT"; then
+          write_api_backend "rust"
+          return 0
+        fi
+        return 1
+        ;;
+      cargo)
+        if start_process "api" "$API_PID_FILE" "$API_LOG" "$API_CMD_CARGO_DIR" cargo run --release -- --host 0.0.0.0 --port "$PORT"; then
+          write_api_backend "rust"
+          return 0
+        fi
+        return 1
+        ;;
+      *)
+        die "[api] internal error: unknown command kind $API_CMD_KIND"
+        ;;
+    esac
+  fi
+
   if [[ -n "$FOLDER" ]]; then
-    start_process "api" "$API_PID_FILE" "$API_LOG" "$SCRIPT_DIR" "$PYTHON_BIN" run.py "$FOLDER" --port "$PORT" --no-browser
+    if start_process "api" "$API_PID_FILE" "$API_LOG" "$SCRIPT_DIR" "$PYTHON_BIN" run.py "$FOLDER" --port "$PORT" --no-browser; then
+      write_api_backend "python"
+      return 0
+    fi
+    return 1
   else
-    start_process "api" "$API_PID_FILE" "$API_LOG" "$SCRIPT_DIR" "$PYTHON_BIN" -m uvicorn main:app --host 0.0.0.0 --port "$PORT" --log-level warning
+    if start_process "api" "$API_PID_FILE" "$API_LOG" "$SCRIPT_DIR" "$PYTHON_BIN" -m uvicorn main:app --host 0.0.0.0 --port "$PORT" --log-level warning; then
+      write_api_backend "python"
+      return 0
+    fi
+    return 1
   fi
 }
 
 start_rescan_worker_process() {
+  if rust_scanner_enabled; then
+    if [[ -f "$RESCAN_PID_FILE" ]]; then
+      stop_process "rescan-worker" "$RESCAN_PID_FILE"
+    fi
+    start_scanner_worker_process
+    return $?
+  fi
+  if [[ -f "$SCANNER_PID_FILE" ]]; then
+    stop_process "scanner-worker" "$SCANNER_PID_FILE"
+  fi
   start_process "rescan-worker" "$RESCAN_PID_FILE" "$RESCAN_LOG" "$SCRIPT_DIR" "$PYTHON_BIN" worker.py
+}
+
+start_scanner_worker_process() {
+  resolve_scanner_command
+
+  case "$SCANNER_CMD_KIND" in
+    bin)
+      start_process "scanner-worker" "$SCANNER_PID_FILE" "$SCANNER_LOG" "$SCRIPT_DIR" "$SCANNER_CMD_PATH"
+      ;;
+    cargo)
+      start_process "scanner-worker" "$SCANNER_PID_FILE" "$SCANNER_LOG" "$SCANNER_CMD_CARGO_DIR" cargo run --release
+      ;;
+    *)
+      die "[scanner-worker] internal error: unknown command kind $SCANNER_CMD_KIND"
+      ;;
+  esac
 }
 
 start_thumb_worker_process() {
@@ -630,8 +844,12 @@ stop_all() {
     stop_process "metadata-worker" "$METADATA_PID_FILE"
   fi
   stop_process "thumb-worker" "$THUMB_PID_FILE"
+  if rust_scanner_enabled || [[ -f "$SCANNER_PID_FILE" ]]; then
+    stop_process "scanner-worker" "$SCANNER_PID_FILE"
+  fi
   stop_process "rescan-worker" "$RESCAN_PID_FILE"
   stop_process "api" "$API_PID_FILE"
+  rm -f "$API_BACKEND_FILE"
   rm -f "$PORT_FILE"
 }
 
@@ -716,6 +934,27 @@ verify_metadata_worker_alive() {
   return 0
 }
 
+verify_scanner_worker_alive() {
+  local scanner_pid
+
+  if ! rust_scanner_enabled; then
+    return 0
+  fi
+
+  sleep 0.5
+  scanner_pid="$(read_pid "$SCANNER_PID_FILE" || true)"
+  if [[ -z "${scanner_pid:-}" ]] || ! is_running_pid "$scanner_pid"; then
+    echo "[scanner-worker] exited after start"
+    echo "Tip: ./start.sh logs scanner"
+    if [[ -f "$SCANNER_LOG" ]]; then
+      echo "----- last 40 lines of scanner-worker log -----"
+      tail -n 40 "$SCANNER_LOG" || true
+    fi
+    return 1
+  fi
+  return 0
+}
+
 status_one() {
   local name="$1"
   local pid_file="$2"
@@ -730,14 +969,96 @@ status_one() {
   fi
 }
 
+status_python_bin() {
+  if [[ -x "$VENV_DIR/bin/python" ]]; then
+    echo "$VENV_DIR/bin/python"
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+    return 0
+  fi
+  if command -v python >/dev/null 2>&1; then
+    command -v python
+    return 0
+  fi
+  return 1
+}
+
+status_db_line() {
+  local py
+  if ! py="$(status_python_bin)"; then
+    echo "[db] unknown (python not found)"
+    return 0
+  fi
+
+  if "$py" - <<'PY' >/dev/null 2>&1
+import psycopg
+from app.config import DATABASE_URL
+
+with psycopg.connect(DATABASE_URL, connect_timeout=2) as conn:
+    with conn.cursor() as cur:
+        cur.execute("select 1")
+        cur.fetchone()
+PY
+  then
+    echo "[db] ready"
+  else
+    echo "[db] not ready"
+  fi
+}
+
+status_thumb_line() {
+  local mode="${IMGVIEWER_THUMB_JOB_MODE:-sync}"
+  local thumb_pid
+  thumb_pid="$(read_pid "$THUMB_PID_FILE" || true)"
+  if [[ -n "${thumb_pid:-}" ]] && is_running_pid "$thumb_pid"; then
+    mode="queue"
+  fi
+  echo "[thumb] mode=$mode"
+}
+
+status_metadata_line() {
+  local enabled="disabled"
+  local state="stopped"
+  local pid
+
+  if metadata_worker_enabled; then
+    enabled="enabled"
+  fi
+
+  pid="$(read_pid "$METADATA_PID_FILE" || true)"
+  if [[ -n "${pid:-}" ]] && is_running_pid "$pid"; then
+    enabled="enabled"
+    state="running pid=$pid"
+  fi
+
+  echo "[metadata] $enabled state=$state"
+}
+
 status_all() {
   local api_running=0
+  echo "[api] backend=$(api_backend)"
+  echo "[scanner] backend=$(scanner_backend)"
+  status_thumb_line
+  status_metadata_line
+  status_db_line
   if status_one "api" "$API_PID_FILE"; then
     api_running=1
   fi
-  status_one "rescan-worker" "$RESCAN_PID_FILE" || true
+  if scanner_backend_is_rust; then
+    status_one "scanner-worker" "$SCANNER_PID_FILE" || true
+    if [[ -f "$RESCAN_PID_FILE" ]]; then
+      status_one "rescan-worker" "$RESCAN_PID_FILE" || true
+    fi
+  else
+    status_one "rescan-worker" "$RESCAN_PID_FILE" || true
+    if [[ -f "$SCANNER_PID_FILE" ]]; then
+      status_one "scanner-worker" "$SCANNER_PID_FILE" || true
+    fi
+  fi
   status_one "thumb-worker" "$THUMB_PID_FILE" || true
-  if metadata_worker_enabled || [[ -f "$METADATA_PID_FILE" ]]; then
+  if [[ -f "$METADATA_PID_FILE" ]]; then
     status_one "metadata-worker" "$METADATA_PID_FILE" || true
   fi
 
@@ -771,7 +1092,11 @@ show_logs() {
   case "$LOG_TARGET" in
     "")
       tail_log_file "api" "$API_LOG"
-      tail_log_file "rescan-worker" "$RESCAN_LOG"
+      if scanner_backend_is_rust; then
+        tail_log_file "scanner-worker" "$SCANNER_LOG"
+      else
+        tail_log_file "rescan-worker" "$RESCAN_LOG"
+      fi
       tail_log_file "thumb-worker" "$THUMB_LOG"
       if metadata_worker_enabled || [[ -f "$METADATA_LOG" ]]; then
         tail_log_file "metadata-worker" "$METADATA_LOG"
@@ -781,7 +1106,14 @@ show_logs() {
       tail_log_file "api" "$API_LOG"
       ;;
     rescan)
-      tail_log_file "rescan-worker" "$RESCAN_LOG"
+      if scanner_backend_is_rust; then
+        tail_log_file "scanner-worker" "$SCANNER_LOG"
+      else
+        tail_log_file "rescan-worker" "$RESCAN_LOG"
+      fi
+      ;;
+    scanner)
+      tail_log_file "scanner-worker" "$SCANNER_LOG"
       ;;
     thumb)
       tail_log_file "thumb-worker" "$THUMB_LOG"
@@ -801,6 +1133,7 @@ start_background() {
   local db_timeout_sec
 
   apply_strict_rust_if_requested
+  apply_rust_scanner_if_requested
   prepare_runtime_dependencies
   validate_folder
   ensure_port_available
@@ -811,8 +1144,22 @@ start_background() {
     exit 1
   fi
 
-  start_api_process
-  start_rescan_worker_process
+  if ! start_api_process; then
+    warn "[start] stopping started processes because api failed"
+    stop_all
+    exit 1
+  fi
+  if ! start_rescan_worker_process; then
+    warn "[start] stopping started processes because scanner backend failed"
+    stop_all
+    exit 1
+  fi
+
+  if ! verify_scanner_worker_alive; then
+    warn "[start] stopping started processes because scanner backend failed"
+    stop_all
+    exit 1
+  fi
 
   if ! start_thumb_worker_process; then
     if [[ "$STRICT_RUST" -eq 1 ]]; then
@@ -869,6 +1216,7 @@ start_foreground() {
   local db_timeout_sec
 
   apply_strict_rust_if_requested
+  apply_rust_scanner_if_requested
   prepare_runtime_dependencies
   validate_folder
   ensure_port_available
@@ -888,7 +1236,27 @@ start_foreground() {
   fi
 
   if [[ -n "$FOLDER" ]]; then
-    exec "$PYTHON_BIN" run.py "$FOLDER" --port "$PORT" --no-browser
+    if rust_api_enabled; then
+      set_start_folder_for_rust_api_if_needed
+    else
+      exec "$PYTHON_BIN" run.py "$FOLDER" --port "$PORT" --no-browser
+    fi
+  fi
+
+  if rust_api_enabled; then
+    resolve_api_command
+    case "$API_CMD_KIND" in
+      bin)
+        exec "$API_CMD_PATH" --host 0.0.0.0 --port "$PORT"
+        ;;
+      cargo)
+        cd "$API_CMD_CARGO_DIR"
+        exec cargo run --release -- --host 0.0.0.0 --port "$PORT"
+        ;;
+      *)
+        die "[api] internal error: unknown command kind $API_CMD_KIND"
+        ;;
+    esac
   fi
 
   exec "$PYTHON_BIN" -m uvicorn main:app --host 0.0.0.0 --port "$PORT" --log-level warning
@@ -947,7 +1315,7 @@ parse_args() {
         die "Command should be specified only once"
         ;;
       *)
-        if [[ "$ACTION" == "logs" && -z "$LOG_TARGET" && "$1" =~ ^(api|rescan|thumb|metadata)$ ]]; then
+        if [[ "$ACTION" == "logs" && -z "$LOG_TARGET" && "$1" =~ ^(api|rescan|scanner|thumb|metadata)$ ]]; then
           LOG_TARGET="$1"
           shift
           continue

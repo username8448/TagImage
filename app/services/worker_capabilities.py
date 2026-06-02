@@ -17,10 +17,26 @@ def _thumb_rust_supported() -> bool:
     return cargo_toml.exists() or rust_binary.exists()
 
 
+def _scanner_rust_supported() -> bool:
+    repo_root = Path(__file__).resolve().parents[2]
+    cargo_toml = repo_root / "rust" / "scanner-worker" / "Cargo.toml"
+    rust_binary = repo_root / "rust" / "thumb-worker" / "target" / "release" / "imgviewer-scanner-worker"
+    return cargo_toml.exists() or rust_binary.exists()
+
+
+def _metadata_rust_supported() -> bool:
+    repo_root = Path(__file__).resolve().parents[2]
+    cargo_toml = repo_root / "rust" / "metadata-worker" / "Cargo.toml"
+    rust_binary = repo_root / "rust" / "thumb-worker" / "target" / "release" / "imgviewer-metadata-worker"
+    return cargo_toml.exists() or rust_binary.exists()
+
+
 def get_worker_capabilities() -> dict[str, Any]:
     thumb_mode = os.getenv("IMGVIEWER_THUMB_JOB_MODE", "sync").strip().lower()
     thumb_sync_fallback = _env_bool("IMGVIEWER_THUMB_SYNC_FALLBACK", False)
     inline_worker_enabled = _env_bool("IMGVIEWER_INLINE_WORKER", True)
+    rust_scanner_enabled = _env_bool("IMGVIEWER_RUST_SCANNER", False)
+    metadata_worker_enabled = _env_bool("IMGVIEWER_METADATA_WORKER", False)
 
     return {
         "thumb": {
@@ -29,13 +45,14 @@ def get_worker_capabilities() -> dict[str, Any]:
             "python_fallback": thumb_sync_fallback,
         },
         "rescan": {
-            "mode": "python",
-            "rust_supported": False,
+            "mode": "rust" if rust_scanner_enabled else "python",
+            "rust_supported": _scanner_rust_supported(),
             "inline_worker": inline_worker_enabled,
         },
         "metadata": {
-            "mode": "not_enabled",
-            "rust_supported": False,
+            "mode": "shadow" if metadata_worker_enabled else "not_enabled",
+            "rust_supported": _metadata_rust_supported(),
+            "authoritative": False,
         },
         "hash": {
             "mode": "not_enabled",

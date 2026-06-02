@@ -236,16 +236,57 @@ IMGVIEWER_THUMB_JOB_MODE=queue ./start.sh start
 
 Скрипт поднимает:
 
-- API (`uvicorn`)
-- Python rescan worker
-- Rust thumb worker (в режиме `IMGVIEWER_THUMB_JOB_MODE=queue`, если доступен бинарник/cargo)
+- API backend: Python FastAPI по умолчанию, Rust `api-server` только при `IMGVIEWER_RUST_API=1`
+- Scanner backend: Python rescan worker по умолчанию, Rust `scanner-worker` только при `IMGVIEWER_RUST_SCANNER=1`
+- Rust thumb worker в режиме `IMGVIEWER_THUMB_JOB_MODE=queue`, если доступен бинарник/cargo
+- Rust metadata worker только при `IMGVIEWER_METADATA_WORKER=1`
 
 Логи: `.logs/`, pid-файлы: `.run/`.
 
 `start-webapp.sh` теперь deprecated compatibility wrapper, который просто прокидывает аргументы в `./start.sh`.
 
+### Runtime profiles
+
+Подробное описание профилей находится в [docs/rust-first-runtime.md](docs/rust-first-runtime.md).
+
+Default/dev fallback оставляет Python API и Python scanner reference/authoritative реализацией. Rust компоненты включаются только через флаги, поэтому обычный запуск остается совместимым:
+
+```bash
+./start.sh start --build-rust --strict-rust --no-open
+```
+
+Rust-first dev profile включается явно через `.env` или env vars:
+
+```bash
+IMGVIEWER_RUST_API=1
+IMGVIEWER_RUST_SCANNER=1
+IMGVIEWER_THUMB_JOB_MODE=queue
+IMGVIEWER_INLINE_WORKER=0
+IMGVIEWER_THUMB_SYNC_FALLBACK=0
+IMGVIEWER_THUMB_WORKERS=4
+```
+
+Эти флаги не являются hardcoded default. Для явного возврата к Python fallback:
+
+```bash
+IMGVIEWER_RUST_API=0 IMGVIEWER_RUST_SCANNER=0 ./start.sh start --build-rust --strict-rust --no-open
+```
+
+Optional metadata shadow включается отдельно:
+
+```bash
+IMGVIEWER_METADATA_WORKER=1 ./start.sh start --build-rust --strict-rust --no-open
+```
+
+Metadata worker пока не authoritative и может создавать дополнительную фоновую нагрузку. Python API/scanner не удалены: cleanup legacy откладывается до authoritative metadata и зеленых parity/runtime проверок.
+
+`./start.sh status` диагностически показывает `api backend`, `scanner backend`, `thumb mode`, `metadata enabled/state`, DB readiness и текущие процессы. Это не меняет launch behavior.
+
 ## Runtime env
 
+- `IMGVIEWER_RUST_API` (default `0`)
+- `IMGVIEWER_RUST_SCANNER` (default `0`)
+- `IMGVIEWER_METADATA_WORKER` (default `0`)
 - `IMGVIEWER_THUMB_WAIT_MS` (default `1200`)
 - `IMGVIEWER_THUMB_POLL_MS` (default `120`)
 - `IMGVIEWER_THUMB_SYNC_FALLBACK` (default `0`)

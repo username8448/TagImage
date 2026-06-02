@@ -41,6 +41,18 @@ def configure_effective_database_url() -> None:
 configure_effective_database_url()
 
 
+def configure_test_runtime_env() -> None:
+    os.environ.setdefault("IMGVIEWER_INLINE_WORKER", "0")
+    os.environ.setdefault("IMGVIEWER_THUMB_JOB_MODE", "queue")
+    os.environ.setdefault("IMGVIEWER_THUMB_WAIT_MS", "50")
+    os.environ.setdefault("IMGVIEWER_THUMB_POLL_MS", "20")
+    os.environ.setdefault("IMGVIEWER_THUMB_SYNC_FALLBACK", "0")
+    os.environ.setdefault("IMGVIEWER_THUMB_WORKER_EXPECTED", "1")
+
+
+configure_test_runtime_env()
+
+
 def snapshot_app_session(cur):
     cur.execute(
         """
