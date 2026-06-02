@@ -32,11 +32,23 @@ def _metadata_rust_supported() -> bool:
 
 
 def get_worker_capabilities() -> dict[str, Any]:
-    thumb_mode = os.getenv("IMGVIEWER_THUMB_JOB_MODE", "sync").strip().lower()
+    legacy_python = _env_bool("IMGVIEWER_LEGACY_PYTHON", False)
+    thumb_mode = (
+        os.getenv("IMGVIEWER_THUMB_JOB_MODE", "sync" if legacy_python else "queue")
+        .strip()
+        .lower()
+    )
     thumb_sync_fallback = _env_bool("IMGVIEWER_THUMB_SYNC_FALLBACK", False)
-    inline_worker_enabled = _env_bool("IMGVIEWER_INLINE_WORKER", True)
-    rust_scanner_enabled = _env_bool("IMGVIEWER_RUST_SCANNER", False)
-    metadata_worker_enabled = _env_bool("IMGVIEWER_METADATA_WORKER", False)
+    inline_worker_enabled = _env_bool("IMGVIEWER_INLINE_WORKER", legacy_python)
+    rust_scanner_enabled = _env_bool("IMGVIEWER_RUST_SCANNER", not legacy_python)
+    metadata_worker_enabled = _env_bool("IMGVIEWER_METADATA_WORKER", not legacy_python)
+    metadata_authoritative = metadata_worker_enabled and _env_bool(
+        "IMGVIEWER_METADATA_AUTHORITATIVE",
+        not legacy_python,
+    )
+    metadata_mode = "not_enabled"
+    if metadata_worker_enabled:
+        metadata_mode = "authoritative" if metadata_authoritative else "shadow"
 
     return {
         "thumb": {
@@ -50,9 +62,9 @@ def get_worker_capabilities() -> dict[str, Any]:
             "inline_worker": inline_worker_enabled,
         },
         "metadata": {
-            "mode": "shadow" if metadata_worker_enabled else "not_enabled",
+            "mode": metadata_mode,
             "rust_supported": _metadata_rust_supported(),
-            "authoritative": False,
+            "authoritative": metadata_authoritative,
         },
         "hash": {
             "mode": "not_enabled",

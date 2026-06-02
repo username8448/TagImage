@@ -9,7 +9,18 @@ _inline_worker_thread = None
 
 def start_inline_worker_if_enabled() -> None:
     global _inline_worker_thread
-    enabled = os.getenv("IMGVIEWER_INLINE_WORKER", "1").strip().lower() not in {"0", "false", "no"}
+    legacy_default = os.getenv("IMGVIEWER_LEGACY_PYTHON", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    default_value = "1" if legacy_default else "0"
+    enabled = os.getenv("IMGVIEWER_INLINE_WORKER", default_value).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }
     if not enabled:
         return
     if _inline_worker_thread is not None and _inline_worker_thread.is_alive():

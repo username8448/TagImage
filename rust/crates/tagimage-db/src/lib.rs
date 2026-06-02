@@ -532,6 +532,7 @@ pub async fn mark_metadata_succeeded(
     client: &mut Client,
     job: &ClaimedJob,
     metadata_json: Value,
+    authoritative: bool,
 ) -> Result<(), String> {
     let tx = client
         .transaction()
@@ -562,12 +563,7 @@ pub async fn mark_metadata_succeeded(
     .await
     .map_err(|e| format!("update attempt succeed: {e}"))?;
 
-    let event_data = json!({
-        "attempt": job.attempt,
-        "completed_at": now_unix(),
-        "metadata": metadata_json,
-        "shadow": true,
-    });
+    let event_data = metadata_success_event_data(job.attempt, metadata_json, authoritative);
 
     tx.execute(
         "INSERT INTO job_events (job_id, event, data) VALUES ($1, 'succeeded', $2)",
@@ -579,6 +575,20 @@ pub async fn mark_metadata_succeeded(
     tx.commit()
         .await
         .map_err(|e| format!("commit succeed: {e}"))
+}
+
+pub fn metadata_success_event_data(
+    attempt: i32,
+    metadata_json: Value,
+    authoritative: bool,
+) -> Value {
+    json!({
+        "attempt": attempt,
+        "completed_at": now_unix(),
+        "metadata": metadata_json,
+        "authoritative": authoritative,
+        "shadow": !authoritative,
+    })
 }
 
 pub async fn claim_next_scanner_shadow_job(
@@ -863,4 +873,28 @@ pub async fn mark_metadata_failed(
     .map_err(|e| format!("insert fail event: {e}"))?;
 
     tx.commit().await.map_err(|e| format!("commit fail: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::metadata_success_event_data;
+    use serde_json::json;
+
+    #[test]
+    fn metadata_success_event_marks_authoritative_mode() {
+        let event = metadata_success_event_data(2, json!({"image_id": "img-1"}), true);
+
+        assert_eq!(event["attempt"], 2);
+        assert_eq!(event["metadata"]["image_id"], "img-1");
+        assert_eq!(event["authoritative"], true);
+        assert_eq!(event["shadow"], false);
+    }
+
+    #[test]
+    fn metadata_success_event_keeps_shadow_mode_available() {
+        let event = metadata_success_event_data(1, json!({"image_id": "img-2"}), false);
+
+        assert_eq!(event["authoritative"], false);
+        assert_eq!(event["shadow"], true);
+    }
 }

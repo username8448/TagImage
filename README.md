@@ -177,12 +177,14 @@ export IMGVIEWER_THUMB_JOB_MODE=queue
 
 Галерея использует `/thumb-file/{id}.jpg` для готовых миниатюр и обращается к `/thumb/{id}` только как fallback, если файл еще не создан.
 
-По умолчанию в API включен inline fallback-воркер (`IMGVIEWER_INLINE_WORKER=1`), чтобы приложение работало даже без отдельного процесса.
+В Rust-first runtime inline fallback-воркер выключен (`IMGVIEWER_INLINE_WORKER=0`), а production thumbnail jobs обрабатывает Rust thumb-worker. В legacy Python runtime inline fallback можно вернуть через `IMGVIEWER_INLINE_WORKER=1`.
 
-Для строгого режима с отдельным воркером:
+Для ручного Python legacy режима:
 
 ```bash
-IMGVIEWER_INLINE_WORKER=0 python run.py
+IMGVIEWER_LEGACY_PYTHON=1 python run.py
+# или с отдельным Python worker:
+IMGVIEWER_LEGACY_PYTHON=1 IMGVIEWER_INLINE_WORKER=0 python run.py
 ```
 
 ### Rust thumb worker
@@ -205,7 +207,7 @@ IMGVIEWER_THUMB_JOB_MODE=queue ./start.sh start
 
 ```bash
 .venv/bin/python scripts/enqueue-metadata-jobs.py --limit 20
-./scripts/run-metadata-worker.sh --timeout 30
+IMGVIEWER_METADATA_AUTHORITATIVE=0 ./scripts/run-metadata-worker.sh --timeout 30
 ```
 
 `run-metadata-worker.sh` и `enqueue-metadata-jobs.py` загружают `.env`, поэтому используют тот же `DATABASE_URL`, что и `start.sh`.
@@ -236,10 +238,10 @@ IMGVIEWER_THUMB_JOB_MODE=queue ./start.sh start
 
 Скрипт поднимает:
 
-- API backend: Python FastAPI по умолчанию, Rust `api-server` только при `IMGVIEWER_RUST_API=1`
-- Scanner backend: Python rescan worker по умолчанию, Rust `scanner-worker` только при `IMGVIEWER_RUST_SCANNER=1`
-- Rust thumb worker в режиме `IMGVIEWER_THUMB_JOB_MODE=queue`, если доступен бинарник/cargo
-- Rust metadata worker только при `IMGVIEWER_METADATA_WORKER=1`
+- Rust API backend по умолчанию
+- Rust scanner-worker для production `rescan` jobs по умолчанию
+- Rust thumb worker в режиме `IMGVIEWER_THUMB_JOB_MODE=queue`
+- Rust metadata worker в authoritative mode по умолчанию
 
 Логи: `.logs/`, pid-файлы: `.run/`.
 
@@ -249,44 +251,59 @@ IMGVIEWER_THUMB_JOB_MODE=queue ./start.sh start
 
 Подробное описание профилей находится в [docs/rust-first-runtime.md](docs/rust-first-runtime.md).
 
-Default/dev fallback оставляет Python API и Python scanner reference/authoritative реализацией. Rust компоненты включаются только через флаги, поэтому обычный запуск остается совместимым:
+Default runtime теперь Rust-first. Python API и Python scanner остаются в репозитории как legacy/reference fallback, но обычный `./start.sh` их не запускает:
 
 ```bash
 ./start.sh start --build-rust --strict-rust --no-open
 ```
 
-Rust-first dev profile включается явно через `.env` или env vars:
+Rust-first defaults:
 
 ```bash
 IMGVIEWER_RUST_API=1
 IMGVIEWER_RUST_SCANNER=1
+IMGVIEWER_METADATA_WORKER=1
+IMGVIEWER_METADATA_AUTHORITATIVE=1
 IMGVIEWER_THUMB_JOB_MODE=queue
 IMGVIEWER_INLINE_WORKER=0
 IMGVIEWER_THUMB_SYNC_FALLBACK=0
 IMGVIEWER_THUMB_WORKERS=4
 ```
 
-Эти флаги не являются hardcoded default. Для явного возврата к Python fallback:
+Env precedence для runtime flags:
+
+1. explicit shell env;
+2. `IMGVIEWER_LEGACY_PYTHON=1` legacy defaults;
+3. `.env`;
+4. built-in Rust defaults.
+
+Для явного возврата к Python fallback:
 
 ```bash
-IMGVIEWER_RUST_API=0 IMGVIEWER_RUST_SCANNER=0 ./start.sh start --build-rust --strict-rust --no-open
+IMGVIEWER_LEGACY_PYTHON=1 ./start.sh start --build-rust --no-open
+# или точечно:
+IMGVIEWER_RUST_API=0 IMGVIEWER_RUST_SCANNER=0 IMGVIEWER_METADATA_WORKER=0 IMGVIEWER_THUMB_JOB_MODE=sync ./start.sh start --build-rust --no-open
 ```
 
-Optional metadata shadow включается отдельно:
+Metadata authoritative означает, что metadata jobs больше не являются shadow-validation jobs и пишут `job_events` с `authoritative=true`, `shadow=false`. Production image row metadata уже обновляется Rust scanner authoritative path, поэтому metadata worker не дублирует запись в `images`.
+
+Для ручной shadow-проверки metadata:
 
 ```bash
-IMGVIEWER_METADATA_WORKER=1 ./start.sh start --build-rust --strict-rust --no-open
+IMGVIEWER_METADATA_AUTHORITATIVE=0 ./scripts/run-metadata-worker.sh --timeout 30
 ```
 
-Metadata worker пока не authoritative и может создавать дополнительную фоновую нагрузку. Python API/scanner не удалены: cleanup legacy откладывается до authoritative metadata и зеленых parity/runtime проверок.
-
-`./start.sh status` диагностически показывает `api backend`, `scanner backend`, `thumb mode`, `metadata enabled/state`, DB readiness и текущие процессы. Это не меняет launch behavior.
+`./start.sh status` диагностически показывает `api backend`, `scanner backend`, `thumb mode`, `metadata mode`, `metadata authoritative`, DB readiness и текущие процессы.
 
 ## Runtime env
 
-- `IMGVIEWER_RUST_API` (default `0`)
-- `IMGVIEWER_RUST_SCANNER` (default `0`)
-- `IMGVIEWER_METADATA_WORKER` (default `0`)
+- `IMGVIEWER_RUST_API` (default `1`)
+- `IMGVIEWER_RUST_SCANNER` (default `1`)
+- `IMGVIEWER_METADATA_WORKER` (default `1`)
+- `IMGVIEWER_METADATA_AUTHORITATIVE` (default `1`)
+- `IMGVIEWER_LEGACY_PYTHON` (default `0`)
+- `IMGVIEWER_THUMB_JOB_MODE` (default `queue`)
+- `IMGVIEWER_INLINE_WORKER` (default `0`)
 - `IMGVIEWER_THUMB_WAIT_MS` (default `1200`)
 - `IMGVIEWER_THUMB_POLL_MS` (default `120`)
 - `IMGVIEWER_THUMB_SYNC_FALLBACK` (default `0`)

@@ -55,6 +55,19 @@ METADATA_CMD_KIND=""
 METADATA_CMD_PATH=""
 METADATA_CMD_CARGO_DIR="$SCRIPT_DIR/rust/metadata-worker"
 
+RUNTIME_ENV_NAMES=(
+  IMGVIEWER_LEGACY_PYTHON
+  IMGVIEWER_RUST_API
+  IMGVIEWER_RUST_SCANNER
+  IMGVIEWER_METADATA_WORKER
+  IMGVIEWER_METADATA_AUTHORITATIVE
+  IMGVIEWER_THUMB_JOB_MODE
+  IMGVIEWER_INLINE_WORKER
+  IMGVIEWER_THUMB_SYNC_FALLBACK
+  IMGVIEWER_THUMB_WORKERS
+  IMGVIEWER_THUMB_WORKER_EXPECTED
+)
+
 usage() {
   cat <<'USAGE'
 Usage:
@@ -83,14 +96,16 @@ Examples:
   ./start.sh
   ./start.sh /data/photos --port 9000
   ./start.sh start --build-rust --strict-rust
-  IMGVIEWER_THUMB_JOB_MODE=queue ./start.sh start
+  IMGVIEWER_LEGACY_PYTHON=1 ./start.sh start
 
 Env:
   IMGVIEWER_STARTUP_TIMEOUT_SEC  API readiness wait timeout in seconds (default: 20)
   IMGVIEWER_DB_STARTUP_TIMEOUT_SEC  DB readiness wait timeout in seconds (default: 30)
-  IMGVIEWER_RUST_API            Run Rust api-server instead of Python FastAPI when set to 1
-  IMGVIEWER_METADATA_WORKER      Start Rust metadata-worker when set to 1
-  IMGVIEWER_RUST_SCANNER         Run Rust scanner-worker for rescan jobs when set to 1
+  IMGVIEWER_LEGACY_PYTHON        Use explicit Python legacy runtime defaults when set to 1
+  IMGVIEWER_RUST_API             Run Rust api-server instead of Python FastAPI (default: 1)
+  IMGVIEWER_METADATA_WORKER      Start Rust metadata-worker (default: 1)
+  IMGVIEWER_METADATA_AUTHORITATIVE  Metadata jobs write authoritative events (default: 1)
+  IMGVIEWER_RUST_SCANNER         Run Rust scanner-worker for rescan jobs (default: 1)
 USAGE
 }
 
@@ -119,6 +134,83 @@ load_env_file() {
     set +a
     ok "[env] loaded .env"
   fi
+}
+
+capture_explicit_runtime_env() {
+  local name
+  for name in "${RUNTIME_ENV_NAMES[@]}"; do
+    if [[ -n "$(eval "printf '%s' \"\${$name+x}\"")" ]]; then
+      declare -g "EXPLICIT_${name}=1"
+      declare -g "SAVED_${name}=$(eval "printf '%s' \"\${$name}\"")"
+    else
+      declare -g "EXPLICIT_${name}=0"
+      declare -g "SAVED_${name}="
+    fi
+  done
+}
+
+restore_explicit_runtime_env() {
+  local name marker value_name
+  for name in "${RUNTIME_ENV_NAMES[@]}"; do
+    marker="EXPLICIT_${name}"
+    if [[ "${!marker:-0}" == "1" ]]; then
+      value_name="SAVED_${name}"
+      export "$name=${!value_name}"
+    fi
+  done
+}
+
+runtime_env_was_explicit() {
+  local marker="EXPLICIT_$1"
+  [[ "${!marker:-0}" == "1" ]]
+}
+
+env_bool_enabled() {
+  local raw="${1:-0}"
+  case "${raw,,}" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+set_runtime_default_if_unset() {
+  local name="$1"
+  local value="$2"
+  if [[ -z "$(eval "printf '%s' \"\${$name+x}\"")" ]]; then
+    export "$name=$value"
+  fi
+}
+
+set_runtime_profile_default() {
+  local name="$1"
+  local value="$2"
+  if ! runtime_env_was_explicit "$name"; then
+    export "$name=$value"
+  fi
+}
+
+apply_runtime_defaults() {
+  restore_explicit_runtime_env
+
+  if env_bool_enabled "${IMGVIEWER_LEGACY_PYTHON:-0}"; then
+    set_runtime_profile_default IMGVIEWER_RUST_API 0
+    set_runtime_profile_default IMGVIEWER_RUST_SCANNER 0
+    set_runtime_profile_default IMGVIEWER_METADATA_WORKER 0
+    set_runtime_profile_default IMGVIEWER_METADATA_AUTHORITATIVE 0
+    set_runtime_profile_default IMGVIEWER_THUMB_JOB_MODE sync
+    set_runtime_profile_default IMGVIEWER_INLINE_WORKER 1
+    set_runtime_profile_default IMGVIEWER_THUMB_SYNC_FALLBACK 0
+    return 0
+  fi
+
+  set_runtime_default_if_unset IMGVIEWER_RUST_API 1
+  set_runtime_default_if_unset IMGVIEWER_RUST_SCANNER 1
+  set_runtime_default_if_unset IMGVIEWER_METADATA_WORKER 1
+  set_runtime_default_if_unset IMGVIEWER_METADATA_AUTHORITATIVE 1
+  set_runtime_default_if_unset IMGVIEWER_THUMB_JOB_MODE queue
+  set_runtime_default_if_unset IMGVIEWER_INLINE_WORKER 0
+  set_runtime_default_if_unset IMGVIEWER_THUMB_SYNC_FALLBACK 0
+  set_runtime_default_if_unset IMGVIEWER_THUMB_WORKERS 4
 }
 
 is_running_pid() {
@@ -178,6 +270,20 @@ db_startup_timeout_sec() {
 
 metadata_worker_enabled() {
   [[ "${IMGVIEWER_METADATA_WORKER:-0}" == "1" ]]
+}
+
+metadata_authoritative_enabled() {
+  metadata_worker_enabled && [[ "${IMGVIEWER_METADATA_AUTHORITATIVE:-0}" == "1" ]]
+}
+
+metadata_mode() {
+  if ! metadata_worker_enabled; then
+    echo "not_enabled"
+  elif metadata_authoritative_enabled; then
+    echo "authoritative"
+  else
+    echo "shadow"
+  fi
 }
 
 rust_api_enabled() {
@@ -534,9 +640,15 @@ apply_strict_rust_if_requested() {
 
 apply_rust_scanner_if_requested() {
   if rust_scanner_enabled; then
-    export IMGVIEWER_INLINE_WORKER=0
-    export IMGVIEWER_THUMB_JOB_MODE=queue
-    export IMGVIEWER_THUMB_WORKER_EXPECTED=1
+    if ! runtime_env_was_explicit IMGVIEWER_INLINE_WORKER; then
+      export IMGVIEWER_INLINE_WORKER="${IMGVIEWER_INLINE_WORKER:-0}"
+    fi
+    if ! runtime_env_was_explicit IMGVIEWER_THUMB_JOB_MODE; then
+      export IMGVIEWER_THUMB_JOB_MODE="${IMGVIEWER_THUMB_JOB_MODE:-queue}"
+    fi
+    if [[ "${IMGVIEWER_THUMB_JOB_MODE:-sync}" == "queue" ]] && ! runtime_env_was_explicit IMGVIEWER_THUMB_WORKER_EXPECTED; then
+      export IMGVIEWER_THUMB_WORKER_EXPECTED=1
+    fi
     ok "[scanner] rust backend enabled (thumb queue mode, inline worker off)"
   fi
 }
@@ -1019,21 +1131,22 @@ status_thumb_line() {
 }
 
 status_metadata_line() {
-  local enabled="disabled"
+  local mode
   local state="stopped"
+  local authoritative="false"
   local pid
 
-  if metadata_worker_enabled; then
-    enabled="enabled"
+  mode="$(metadata_mode)"
+  if metadata_authoritative_enabled; then
+    authoritative="true"
   fi
 
   pid="$(read_pid "$METADATA_PID_FILE" || true)"
   if [[ -n "${pid:-}" ]] && is_running_pid "$pid"; then
-    enabled="enabled"
     state="running pid=$pid"
   fi
 
-  echo "[metadata] $enabled state=$state"
+  echo "[metadata] mode=$mode authoritative=$authoritative state=$state"
 }
 
 status_all() {
@@ -1336,7 +1449,9 @@ parse_args() {
 main() {
   parse_args "$@"
 
+  capture_explicit_runtime_env
   load_env_file
+  apply_runtime_defaults
   if [[ "$PORT_EXPLICIT" -ne 1 ]]; then
     if [[ -n "${PORT:-}" ]]; then
       PORT="${PORT}"

@@ -15,6 +15,7 @@ pub struct AppConfig {
     pub inline_worker: bool,
     pub rust_scanner: bool,
     pub metadata_worker: bool,
+    pub metadata_authoritative: bool,
     pub thumb_max_attempts: i32,
     pub rescan_max_attempts: i32,
     pub job_stale_running_sec: i64,
@@ -62,12 +63,22 @@ impl AppConfig {
             i += 1;
         }
 
+        let legacy_python = env_bool("IMGVIEWER_LEGACY_PYTHON", false);
         let thumb_job_mode = std::env::var("IMGVIEWER_THUMB_JOB_MODE")
-            .unwrap_or_else(|_| "sync".to_string())
+            .unwrap_or_else(|_| {
+                if legacy_python {
+                    "sync".to_string()
+                } else {
+                    "queue".to_string()
+                }
+            })
             .trim()
             .to_ascii_lowercase();
         let thumb_worker_expected =
             env_bool("IMGVIEWER_THUMB_WORKER_EXPECTED", thumb_job_mode == "queue");
+        let metadata_worker = env_bool("IMGVIEWER_METADATA_WORKER", !legacy_python);
+        let metadata_authoritative =
+            metadata_worker && env_bool("IMGVIEWER_METADATA_AUTHORITATIVE", !legacy_python);
 
         Ok(Self {
             database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
@@ -82,9 +93,10 @@ impl AppConfig {
             thumb_sync_fallback: env_bool("IMGVIEWER_THUMB_SYNC_FALLBACK", false),
             thumb_worker_expected,
             rescan_worker_expected: env_bool("IMGVIEWER_RESCAN_WORKER_EXPECTED", true),
-            inline_worker: env_bool("IMGVIEWER_INLINE_WORKER", true),
-            rust_scanner: env_bool("IMGVIEWER_RUST_SCANNER", false),
-            metadata_worker: env_bool("IMGVIEWER_METADATA_WORKER", false),
+            inline_worker: env_bool("IMGVIEWER_INLINE_WORKER", legacy_python),
+            rust_scanner: env_bool("IMGVIEWER_RUST_SCANNER", !legacy_python),
+            metadata_worker,
+            metadata_authoritative,
             thumb_max_attempts: env_i32("IMGVIEWER_THUMB_MAX_ATTEMPTS", 5).max(1),
             rescan_max_attempts: env_i32("IMGVIEWER_RESCAN_MAX_ATTEMPTS", 3).max(1),
             job_stale_running_sec: env_i64("IMGVIEWER_JOB_STALE_RUNNING_SEC", 300).max(0),

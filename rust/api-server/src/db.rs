@@ -1759,9 +1759,15 @@ pub async fn status_payload(state: &AppState, client: &Client) -> Result<Value, 
                     "inline_worker": state.config.inline_worker,
                 },
                 "metadata": {
-                    "mode": if state.config.metadata_worker { "shadow" } else { "not_enabled" },
+                    "mode": if !state.config.metadata_worker {
+                        "not_enabled"
+                    } else if state.config.metadata_authoritative {
+                        "authoritative"
+                    } else {
+                        "shadow"
+                    },
                     "rust_supported": state.metadata_rust_supported(),
-                    "authoritative": false,
+                    "authoritative": state.config.metadata_worker && state.config.metadata_authoritative,
                 },
                 "hash": {
                     "mode": "not_enabled",

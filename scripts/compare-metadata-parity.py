@@ -160,6 +160,7 @@ def start_metadata_worker(repo_root: Path) -> tuple[subprocess.Popen[Any], Any]:
     env = os.environ.copy()
     env.setdefault("IMGVIEWER_METADATA_POLL_MS", "100")
     env.setdefault("IMGVIEWER_METADATA_METRICS_INTERVAL_SEC", "0")
+    env["IMGVIEWER_METADATA_AUTHORITATIVE"] = "0"
     process = subprocess.Popen(
         cmd,
         cwd=repo_root,

@@ -110,6 +110,16 @@ fn parse_poll_ms() -> u64 {
     }
 }
 
+fn env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(raw) => matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => default,
+    }
+}
+
 fn ext_lower(source: &Path) -> String {
     source
         .extension()
@@ -163,6 +173,7 @@ async fn run_worker_loop(
     poll_ms: u64,
     metrics_interval_sec: u64,
     slow_ms: u128,
+    authoritative: bool,
 ) -> Result<(), String> {
     let (mut client, connection) = tokio_postgres::connect(&db_url, NoTls)
         .await
@@ -204,7 +215,9 @@ async fn run_worker_loop(
                     "height": extracted.height,
                 });
 
-                if let Err(e) = mark_metadata_succeeded(&mut client, &job, metadata_json).await {
+                if let Err(e) =
+                    mark_metadata_succeeded(&mut client, &job, metadata_json, authoritative).await
+                {
                     eprintln!(
                         "[rust-metadata-worker] mark success failed worker={} job={} error={}",
                         worker_id, job.id, e
@@ -275,10 +288,27 @@ async fn run() -> Result<(), String> {
     let poll_ms = parse_poll_ms();
     let slow_ms = parse_u64_env("IMGVIEWER_METADATA_SLOW_MS", 1000) as u128;
     let metrics_interval_sec = parse_u64_env("IMGVIEWER_METADATA_METRICS_INTERVAL_SEC", 30);
+    let authoritative = env_bool("IMGVIEWER_METADATA_AUTHORITATIVE", false);
 
-    eprintln!("[rust-metadata-worker] started as {}", worker_id);
+    eprintln!(
+        "[rust-metadata-worker] started as {} mode={}",
+        worker_id,
+        if authoritative {
+            "authoritative"
+        } else {
+            "shadow"
+        }
+    );
 
-    run_worker_loop(db_url, worker_id, poll_ms, metrics_interval_sec, slow_ms).await
+    run_worker_loop(
+        db_url,
+        worker_id,
+        poll_ms,
+        metrics_interval_sec,
+        slow_ms,
+        authoritative,
+    )
+    .await
 }
 
 #[tokio::main]

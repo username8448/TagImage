@@ -8,7 +8,6 @@ SUPPORTED_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 INDEX_DIR_NAME = ".imgindex"
 THUMBS_DIR_NAME = "thumbs"
 THUMB_MAX_SIZE = (640, 640)
-THUMB_JOB_MODE = os.getenv("IMGVIEWER_THUMB_JOB_MODE", "sync").strip().lower()
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -16,6 +15,13 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+LEGACY_PYTHON = _env_bool("IMGVIEWER_LEGACY_PYTHON", False)
+THUMB_JOB_MODE = os.getenv(
+    "IMGVIEWER_THUMB_JOB_MODE",
+    "sync" if LEGACY_PYTHON else "queue",
+).strip().lower()
 
 
 def _env_int(name: str, default: int, *, min_value: int = 0) -> int:
