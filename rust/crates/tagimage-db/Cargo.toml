@@ -7,3 +7,7 @@ edition = "2021"
 tagimage-core = { path = "../tagimage-core" }
 tokio-postgres = { version = "0.7.12", features = ["with-serde_json-1"] }
 serde_json = "1"
+rusqlite = { version = "0.40.0", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
