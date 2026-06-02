@@ -365,8 +365,10 @@ wait_for_db_ready() {
   done
 
   echo "[db] not ready (timeout: ${timeout_sec}s)"
-  echo "Try: ./scripts/check-db.sh"
-  echo "Try: ./scripts/repair-db.sh"
+  echo "Try:"
+  echo "  ./scripts/local-postgres.sh init"
+  echo "  ./scripts/local-postgres.sh start"
+  echo "  ./scripts/check-db.sh"
   return 1
 }
 

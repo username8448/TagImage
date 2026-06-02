@@ -18,8 +18,6 @@ The migration is incremental. Current Python and PostgreSQL development mode sta
 
 ## 2. Runtime rule
 
-- Docker is dev/CI tooling only.
-- Docker must not be required for packaged Tauri runtime.
 - PostgreSQL may remain in current development/tests.
 - Packaged desktop runtime should not require user-installed PostgreSQL.
 
@@ -38,7 +36,7 @@ Rationale:
 - single local file
 - easier packaging
 - no server process
-- no Docker requirement
+- no external database server requirement
 - suitable for local image index/cache/session/jobs
 
 Important constraint:
@@ -81,7 +79,6 @@ Current stage keeps existing `start.sh` development mode.
 
 ## 7. What not to do
 
-- Do not require Docker in Tauri runtime.
 - Do not require PostgreSQL in packaged app.
 - Do not delete Python until Rust parity is proven.
 - Do not rewrite scanner from scratch without matching Python behavior.
@@ -93,14 +90,14 @@ Current stage keeps existing `start.sh` development mode.
 Mode A: current dev mode
 
 - `start.sh`
-- PostgreSQL
+- native local PostgreSQL
 - Python API
 - Rust workers
 
 Mode B: Rust migration dev mode
 
 - Python API
-- PostgreSQL
+- native local PostgreSQL
 - Rust thumb/metadata workers
 
 Mode C: future Tauri mode
@@ -124,4 +121,4 @@ If a migration shortcut conflicts with behavior parity, parity wins:
 
 - Keep current API behavior stable.
 - Keep Python reference path available until Rust parity is verified.
-- Keep Docker/PostgreSQL as development tools, not packaged runtime requirements.
+- Keep native local PostgreSQL as temporary development runtime until SQLite is wired.

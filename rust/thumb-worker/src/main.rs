@@ -368,7 +368,7 @@ async fn run_worker_loop(
 
 async fn run() -> Result<(), String> {
     let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://imgviewer:imgviewer@127.0.0.1:5432/imgviewer".to_string()
+        "postgresql://imgviewer:imgviewer@127.0.0.1:55432/imgviewer".to_string()
     });
     let poll_ms = std::env::var("IMGVIEWER_THUMB_WORKER_POLL_MS")
         .ok()

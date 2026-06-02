@@ -1,13 +1,16 @@
 # ImgViewer
 
-Локальная галерея для просмотра и тегирования изображений. Проект работает как локальное приложение: файлы не загружаются наружу, а данные хранятся в PostgreSQL.
+Локальная галерея для просмотра и тегирования изображений. Проект работает как локальное приложение: файлы не загружаются наружу, а данные временно хранятся в native local PostgreSQL. SQLite schema/jobs DB-layer уже подготовлены в Rust, но runtime пока не переключен на SQLite.
 
 ## Быстрый Старт
 
-1. Поднять PostgreSQL:
+1. Поднять native local PostgreSQL:
 
 ```bash
-docker compose up -d postgres
+./scripts/local-postgres.sh init
+./scripts/local-postgres.sh start
+./scripts/local-postgres.sh status
+./scripts/check-db.sh
 ```
 
 2. Установить зависимости:
@@ -30,35 +33,29 @@ npm install
 По умолчанию используется:
 
 ```bash
-DATABASE_URL=postgresql://imgviewer:imgviewer@127.0.0.1:5432/imgviewer
+DATABASE_URL=postgresql://imgviewer:imgviewer@127.0.0.1:55432/imgviewer
 ```
 
 Можно скопировать `.env.example` в `.env`; `start.sh` подхватит его автоматически.
 
 ### Development DB options
 
-A) Docker PostgreSQL (optional dev tooling):
-
-```bash
-docker compose up -d postgres
-```
-
-B) Native local PostgreSQL (without Docker):
+Native local PostgreSQL is the normal temporary runtime until SQLite is wired in:
 
 ```bash
 ./scripts/local-postgres.sh init
 ./scripts/local-postgres.sh start
-./scripts/local-postgres.sh url
+./scripts/local-postgres.sh status
+./scripts/check-db.sh
 ```
 
-Use `DATABASE_URL` in `.env` for the selected DB backend. Example for native mode:
+Use `DATABASE_URL` in `.env` if you need an explicit override:
 
 ```bash
 DATABASE_URL=postgresql://imgviewer:imgviewer@127.0.0.1:55432/imgviewer
 ```
 
 `.env` must not be committed.
-Docker is optional for development, and packaged Tauri runtime must not depend on Docker.
 
 ### Database troubleshooting
 
@@ -68,7 +65,7 @@ Docker is optional for development, and packaged Tauri runtime must not depend o
 ./scripts/check-db.sh
 ```
 
-Безопасное восстановление контейнера PostgreSQL (без удаления volume):
+Native local PostgreSQL repair/status helper:
 
 ```bash
 ./scripts/repair-db.sh
@@ -77,17 +74,18 @@ Docker is optional for development, and packaged Tauri runtime must not depend o
 Полезные команды:
 
 ```bash
-docker compose up -d postgres
+./scripts/local-postgres.sh init
+./scripts/local-postgres.sh start
+./scripts/local-postgres.sh status
 ./scripts/check-db.sh
 ```
 
-`repair-db.sh` не удаляет volume и не выполняет `docker compose down -v`.
-`docker compose down -v` удаляет данные БД и должен запускаться только по явному решению пользователя.
+`repair-db.sh` does not delete database data. It uses `.run/local-postgres` and `.logs/local-postgres.log`.
 
 ### Tauri direction note
 
-Текущий Docker/PostgreSQL путь нужен для разработки и тестов.
-Целевой packaged runtime для Tauri не должен зависеть от Docker.
+Current runtime still uses PostgreSQL, with native local PostgreSQL as the temporary path. SQLite schema/init and jobs queue support exist inside `rust/crates/tagimage-db`; they are file-based and not wired into runtime yet.
+Целевой packaged runtime для Tauri не должен зависеть от PostgreSQL.
 План и ограничения: `docs/tauri-migration-plan.md`.
 
 ## Возможности
@@ -212,7 +210,7 @@ IMGVIEWER_METADATA_AUTHORITATIVE=0 ./scripts/run-metadata-worker.sh --timeout 30
 
 `run-metadata-worker.sh` и `enqueue-metadata-jobs.py` загружают `.env`, поэтому используют тот же `DATABASE_URL`, что и `start.sh`.
 
-## Unified Launcher (non-Docker)
+## Unified Launcher
 
 Основной launcher проекта:
 
@@ -341,7 +339,7 @@ npm run build:frontend
 Рекомендуемый запуск интеграционных тестов:
 
 ```bash
-TEST_DATABASE_URL=postgresql://imgviewer:imgviewer@127.0.0.1:5432/tagimage_test pytest
+TEST_DATABASE_URL=postgresql://imgviewer:imgviewer@127.0.0.1:55432/tagimage_test pytest
 ```
 
 Тесты поддерживают `TEST_DATABASE_URL` и в тестовом контексте используют его вместо обычного `DATABASE_URL`.

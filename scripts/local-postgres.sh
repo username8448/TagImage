@@ -75,16 +75,41 @@ ensure_database_exists() {
   PGPASSWORD="$PGPASSWORD" createdb -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" "$PGDATABASE"
 }
 
+sql_escape_literal() {
+  printf "%s" "$1" | sed "s/'/''/g"
+}
+
+sql_escape_identifier() {
+  printf "%s" "$1" | sed 's/"/""/g'
+}
+
+ensure_role_password() {
+  local role password
+  role="$(sql_escape_identifier "$PGUSER")"
+  password="$(sql_escape_literal "$PGPASSWORD")"
+  if PGPASSWORD="$PGPASSWORD" psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -v ON_ERROR_STOP=1 \
+    -c "ALTER ROLE \"$role\" WITH PASSWORD '$password'" >/dev/null 2>&1; then
+    info "role password ensured: $PGUSER"
+    return 0
+  fi
+  warn "could not ensure password for role $PGUSER; continuing with existing local auth"
+}
+
 init_cluster() {
   ensure_tools
   ensure_dirs
   if is_initialized; then
     info "already initialized: $PGDATA"
+    info "log: $LOG_FILE"
+    info "url: $(db_url)"
     return 0
   fi
   info "initdb at $PGDATA"
   initdb -D "$PGDATA" --username="$PGUSER" --auth=trust >/dev/null
   info "initialized"
+  info "pgdata: $PGDATA"
+  info "log: $LOG_FILE"
+  info "url: $(db_url)"
 }
 
 start_cluster() {
@@ -101,6 +126,7 @@ start_cluster() {
     pg_ctl -D "$PGDATA" -l "$LOG_FILE" -o "-p $PGPORT -h $PGHOST -k $socket_dir" start >/dev/null
   fi
 
+  ensure_role_password
   ensure_database_exists
   info "url: $(db_url)"
 }
@@ -124,11 +150,15 @@ status_cluster() {
   ensure_tools
   if ! is_initialized; then
     info "status: not initialized ($PGDATA)"
+    info "pgdata: $PGDATA"
+    info "log: $LOG_FILE"
     info "url: $(db_url)"
     return 1
   fi
   if ! is_running; then
     info "status: stopped"
+    info "pgdata: $PGDATA"
+    info "log: $LOG_FILE"
     info "url: $(db_url)"
     return 1
   fi

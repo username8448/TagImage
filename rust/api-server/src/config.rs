@@ -82,7 +82,7 @@ impl AppConfig {
 
         Ok(Self {
             database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-                "postgresql://imgviewer:imgviewer@127.0.0.1:5432/imgviewer".to_string()
+                "postgresql://imgviewer:imgviewer@127.0.0.1:55432/imgviewer".to_string()
             }),
             host,
             port,

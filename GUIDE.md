@@ -10,13 +10,15 @@ ImgViewer — локальная галерея для просмотра изо
 |---|---|
 | Python | 3.9+ |
 | PostgreSQL | 14+ |
-| Docker Compose | опционально |
 
 Быстрый локальный вариант:
 
 ```bash
-docker compose up -d postgres
 cp .env.example .env
+./scripts/local-postgres.sh init
+./scripts/local-postgres.sh start
+./scripts/local-postgres.sh status
+./scripts/check-db.sh
 ./start.sh
 ```
 
@@ -24,7 +26,7 @@ cp .env.example .env
 
 ```bash
 pip install -r requirements.txt
-export DATABASE_URL=postgresql://imgviewer:imgviewer@127.0.0.1:5432/imgviewer
+export DATABASE_URL=postgresql://imgviewer:imgviewer@127.0.0.1:55432/imgviewer
 python run.py /home/user/Pictures
 ```
 
@@ -184,7 +186,9 @@ PostgreSQL содержит таблицы:
 PostgreSQL недоступен:
 
 ```bash
-docker compose up -d postgres
+./scripts/local-postgres.sh init
+./scripts/local-postgres.sh start
+./scripts/check-db.sh
 ```
 
 Проверить строку подключения:
@@ -200,12 +204,7 @@ rm -rf /путь/к/фото/.imgindex/thumbs
 ./start.sh /путь/к/фото
 ```
 
-Полный сброс данных PostgreSQL при использовании docker-compose:
-
-```bash
-docker compose down -v
-docker compose up -d postgres
-```
+SQLite schema/init и jobs queue уже есть в `rust/crates/tagimage-db`, но runtime пока остается PostgreSQL. Будущий SQLite runtime должен быть file-based.
 
 ImgViewer остается локальным приложением: без аккаунтов, загрузок файлов на серверы и публичного веб-деплоя.
 
@@ -214,7 +213,7 @@ ImgViewer остается локальным приложением: без а�
 Рекомендуется запускать интеграционные тесты на отдельной тестовой БД:
 
 ```bash
-TEST_DATABASE_URL=postgresql://imgviewer:imgviewer@127.0.0.1:5432/tagimage_test pytest
+TEST_DATABASE_URL=postgresql://imgviewer:imgviewer@127.0.0.1:55432/tagimage_test pytest
 ```
 
 В тестовом контексте `TEST_DATABASE_URL` имеет приоритет.  

@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 
 
-DEFAULT_DATABASE_URL = "postgresql://imgviewer:imgviewer@127.0.0.1:5432/imgviewer"
+DEFAULT_DATABASE_URL = "postgresql://imgviewer:imgviewer@127.0.0.1:55432/imgviewer"
 
 
 def detect_repo_root(start: Path | None = None) -> Path:

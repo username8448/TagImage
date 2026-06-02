@@ -54,7 +54,7 @@ def main():
             sys.exit(1)
         except Exception as e:
             print(f"Database error: {e}")
-            print("Set DATABASE_URL or start the bundled PostgreSQL with: docker compose up -d postgres")
+            print("Start local PostgreSQL with: ./scripts/local-postgres.sh init && ./scripts/local-postgres.sh start")
             sys.exit(1)
 
     url = f"http://localhost:{port}"

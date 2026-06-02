@@ -6,6 +6,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
 PYTHON_BIN=""
+DATABASE_URL_EFFECTIVE=""
 
 info() {
   echo "[check-db] $*"
@@ -52,30 +53,27 @@ pick_python() {
   return 1
 }
 
-run_step() {
-  local title="$1"
-  shift
-  echo
-  info "$title"
-  if ! "$@"; then
-    warn "command failed: $*"
-    return 1
-  fi
-  return 0
-}
-
-container_exists() {
-  docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Fxq "imgviewer-postgres"
-}
-
-container_running() {
-  docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq "imgviewer-postgres"
-}
-
 read_effective_database_url() {
   "$PYTHON_BIN" - <<'PY'
 from app.config import DATABASE_URL
 print(DATABASE_URL)
+PY
+}
+
+check_configured_socket() {
+  "$PYTHON_BIN" - <<'PY'
+import socket
+from urllib.parse import urlparse
+
+from app.config import DATABASE_URL
+
+parsed = urlparse(DATABASE_URL)
+host = parsed.hostname or "127.0.0.1"
+port = parsed.port or 55432
+print(f"[socket] target={host}:{port}")
+with socket.create_connection((host, port), timeout=2):
+    pass
+print("[socket] reachable")
 PY
 }
 
@@ -92,6 +90,18 @@ with psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
 PY
 }
 
+failure_hints() {
+  warn "DB check failed."
+  warn "Normal TagImage runtime uses native local PostgreSQL."
+  warn "Try:"
+  warn "  ./scripts/local-postgres.sh init"
+  warn "  ./scripts/local-postgres.sh start"
+  warn "  ./scripts/local-postgres.sh status"
+  warn "  ./scripts/check-db.sh"
+  warn "Expected DATABASE_URL:"
+  warn "  postgresql://imgviewer:imgviewer@127.0.0.1:55432/imgviewer"
+}
+
 main() {
   info "repo root: $REPO_ROOT"
   load_env_file
@@ -103,36 +113,18 @@ main() {
 
   echo
   info "effective DATABASE_URL from app.config"
-  if ! read_effective_database_url; then
+  if ! DATABASE_URL_EFFECTIVE="$(read_effective_database_url)"; then
     warn "failed to read app.config.DATABASE_URL"
+    failure_hints
+    exit 1
   fi
+  echo "$DATABASE_URL_EFFECTIVE"
 
-  run_step "docker compose services" docker compose config --services || true
-  run_step "docker compose ps" docker compose ps || true
-  run_step "docker ps -a --filter name=imgviewer-postgres" \
-    docker ps -a --filter name=imgviewer-postgres || true
-
-  if container_exists; then
-    run_step "docker port imgviewer-postgres" docker port imgviewer-postgres || true
-    run_step "docker logs --tail=80 imgviewer-postgres" \
-      docker logs --tail 80 imgviewer-postgres || true
-  else
-    warn "container imgviewer-postgres does not exist"
-  fi
-
-  if container_running; then
-    run_step "pg_isready inside container" \
-      docker exec imgviewer-postgres pg_isready -U imgviewer -d imgviewer || true
-
-    if docker exec imgviewer-postgres sh -lc "command -v psql >/dev/null 2>&1"; then
-      run_step "psql select 1 inside container" \
-        docker exec imgviewer-postgres sh -lc \
-          "PGPASSWORD=imgviewer psql -h 127.0.0.1 -U imgviewer -d imgviewer -c 'select 1'" || true
-    else
-      warn "psql is not available inside imgviewer-postgres container"
-    fi
-  else
-    warn "container imgviewer-postgres is not running"
+  echo
+  info "configured host/port reachability"
+  if ! check_configured_socket; then
+    failure_hints
+    exit 1
   fi
 
   echo
@@ -142,13 +134,7 @@ main() {
     exit 0
   fi
 
-  warn "DB check failed."
-  warn "Try: ./scripts/repair-db.sh"
-  warn "If Docker/5432 is unstable, use native local PostgreSQL:"
-  warn "  ./scripts/local-postgres.sh init"
-  warn "  ./scripts/local-postgres.sh start"
-  warn "Then set DATABASE_URL to:"
-  warn "  postgresql://imgviewer:imgviewer@127.0.0.1:55432/imgviewer"
+  failure_hints
   exit 1
 }
 
