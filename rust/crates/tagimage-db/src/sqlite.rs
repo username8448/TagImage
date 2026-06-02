@@ -1,7 +1,46 @@
 use crate::sqlite_schema::{INDEX_STATEMENTS, SQLITE_SCHEMA_VERSION, TABLE_STATEMENTS};
-use rusqlite::Connection;
+use crate::ClaimedJob;
+use rusqlite::{params, Connection, OptionalExtension, Row};
+use serde_json::{json, Value};
 use std::path::Path;
 use std::time::Duration;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SqliteJob {
+    pub id: String,
+    pub job_type: String,
+    pub payload: Value,
+    pub dedupe_key: Option<String>,
+    pub state: String,
+    pub priority: i32,
+    pub attempt: i32,
+    pub max_attempts: i32,
+    pub progress_done: i32,
+    pub progress_total: i32,
+    pub error: Option<String>,
+    pub worker_id: Option<String>,
+    pub scheduled_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SqliteJobEvent {
+    pub id: i64,
+    pub job_id: String,
+    pub event: String,
+    pub data: Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SqliteEnqueueResult {
+    pub job: SqliteJob,
+    pub deduped: bool,
+}
 
 pub fn init_sqlite_db(path: &Path) -> Result<Connection, String> {
     if let Some(parent) = path.parent() {
@@ -64,12 +103,449 @@ pub fn init_sqlite_db(path: &Path) -> Result<Connection, String> {
     Ok(conn)
 }
 
+pub fn enqueue_sqlite_job(
+    conn: &Connection,
+    job_type: &str,
+    payload: Value,
+    priority: i32,
+    max_attempts: i32,
+    dedupe_key: Option<&str>,
+) -> Result<SqliteEnqueueResult, String> {
+    with_immediate_tx(conn, || {
+        if let Some(dedupe_key) = dedupe_key {
+            if let Some(existing) = find_active_job_by_dedupe(conn, job_type, dedupe_key)
+                .map_err(|e| format!("find sqlite active dedupe job type={job_type}: {e}"))?
+            {
+                return Ok(SqliteEnqueueResult {
+                    job: existing,
+                    deduped: true,
+                });
+            }
+        }
+
+        let job_id = Uuid::new_v4().simple().to_string();
+        let payload_text =
+            serde_json::to_string(&payload).map_err(|e| format!("serialize job payload: {e}"))?;
+        let dedupe_key_owned = dedupe_key.map(str::to_string);
+        conn.execute(
+            r#"
+            INSERT INTO jobs (
+                id, job_type, payload, state, priority, max_attempts, scheduled_at, dedupe_key
+            )
+            VALUES (
+                ?1, ?2, ?3, 'queued', ?4, max(1, ?5),
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?6
+            )
+            "#,
+            params![
+                job_id,
+                job_type,
+                payload_text,
+                priority,
+                max_attempts,
+                dedupe_key_owned,
+            ],
+        )
+        .map_err(|e| format!("insert sqlite job: {e}"))?;
+        insert_job_event(conn, &job_id, "enqueued", json!({"job_type": job_type}))?;
+
+        let job = get_sqlite_job(conn, &job_id)?
+            .ok_or_else(|| format!("inserted sqlite job not found: {job_id}"))?;
+        Ok(SqliteEnqueueResult {
+            job,
+            deduped: false,
+        })
+    })
+}
+
+pub fn claim_next_sqlite_job(
+    conn: &Connection,
+    job_type: Option<&str>,
+    worker_id: &str,
+) -> Result<Option<ClaimedJob>, String> {
+    with_immediate_tx(conn, || {
+        let row = if let Some(job_type) = job_type {
+            conn.query_row(
+                r#"
+                UPDATE jobs
+                SET state = 'running',
+                    worker_id = ?1,
+                    started_at = COALESCE(started_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    attempt = attempt + 1,
+                    error = NULL,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = (
+                    SELECT id
+                    FROM jobs
+                    WHERE state = 'queued'
+                      AND scheduled_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                      AND job_type = ?2
+                    ORDER BY priority DESC, scheduled_at, created_at
+                    LIMIT 1
+                )
+                RETURNING id, attempt, max_attempts, payload
+                "#,
+                params![worker_id, job_type],
+                claimed_job_from_row,
+            )
+            .optional()
+        } else {
+            conn.query_row(
+                r#"
+                UPDATE jobs
+                SET state = 'running',
+                    worker_id = ?1,
+                    started_at = COALESCE(started_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    attempt = attempt + 1,
+                    error = NULL,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = (
+                    SELECT id
+                    FROM jobs
+                    WHERE state = 'queued'
+                      AND scheduled_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    ORDER BY priority DESC, scheduled_at, created_at
+                    LIMIT 1
+                )
+                RETURNING id, attempt, max_attempts, payload
+                "#,
+                params![worker_id],
+                claimed_job_from_row,
+            )
+            .optional()
+        }
+        .map_err(|e| format!("claim sqlite job: {e}"))?;
+
+        let Some(job) = row else {
+            return Ok(None);
+        };
+
+        conn.execute(
+            "INSERT INTO job_attempts (job_id, attempt, worker_id, state) VALUES (?1, ?2, ?3, 'running')",
+            params![job.id, job.attempt, worker_id],
+        )
+        .map_err(|e| format!("insert sqlite job attempt: {e}"))?;
+        insert_job_event(
+            conn,
+            &job.id,
+            "started",
+            json!({"attempt": job.attempt, "worker_id": worker_id, "claimed_at": now_unix()}),
+        )?;
+
+        Ok(Some(job))
+    })
+}
+
+pub fn mark_sqlite_job_succeeded(
+    conn: &Connection,
+    job_id: &str,
+    total: Option<i32>,
+    event_data: Option<Value>,
+) -> Result<(), String> {
+    with_immediate_tx(conn, || {
+        let current = get_sqlite_job(conn, job_id)?
+            .ok_or_else(|| format!("sqlite job not found for success: {job_id}"))?;
+        let resolved_total = total.unwrap_or_else(|| {
+            if current.progress_total > 0 {
+                current.progress_total
+            } else {
+                current.progress_done
+            }
+        });
+
+        if let Some(total) = total {
+            conn.execute(
+                r#"
+                UPDATE jobs
+                SET state = 'succeeded',
+                    progress_done = max(0, ?2),
+                    progress_total = max(0, ?2),
+                    finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    error = NULL,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1
+                "#,
+                params![job_id, total],
+            )
+        } else {
+            conn.execute(
+                r#"
+                UPDATE jobs
+                SET state = 'succeeded',
+                    finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    error = NULL,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1
+                "#,
+                params![job_id],
+            )
+        }
+        .map_err(|e| format!("update sqlite job succeeded: {e}"))?;
+
+        set_latest_attempt_state(conn, job_id, "succeeded", None)?;
+        insert_job_event(
+            conn,
+            job_id,
+            "succeeded",
+            event_data.unwrap_or_else(|| json!({"total": resolved_total})),
+        )
+    })
+}
+
+pub fn mark_sqlite_job_failed(
+    conn: &Connection,
+    job_id: &str,
+    error: &str,
+    max_backoff_sec: i64,
+    total_ms: Option<u128>,
+) -> Result<(), String> {
+    with_immediate_tx(conn, || {
+        let job = get_sqlite_job(conn, job_id)?
+            .ok_or_else(|| format!("sqlite job not found for failure: {job_id}"))?;
+        let retries_left = (job.max_attempts - job.attempt).max(0);
+        let (next_state, event_name, backoff) = if retries_left > 0 {
+            let secs = 2_i64
+                .pow(job.attempt.max(1) as u32)
+                .min(max_backoff_sec.max(1));
+            ("queued", "retry_scheduled", secs)
+        } else {
+            ("failed", "failed", 0)
+        };
+
+        if next_state == "queued" {
+            conn.execute(
+                r#"
+                UPDATE jobs
+                SET state = 'queued',
+                    error = ?2,
+                    scheduled_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', printf('+%d seconds', ?3)),
+                    worker_id = NULL,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1
+                "#,
+                params![job_id, error, backoff],
+            )
+        } else {
+            conn.execute(
+                r#"
+                UPDATE jobs
+                SET state = 'failed',
+                    error = ?2,
+                    finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?1
+                "#,
+                params![job_id, error],
+            )
+        }
+        .map_err(|e| format!("update sqlite job failed: {e}"))?;
+
+        set_latest_attempt_state(conn, job_id, next_state, Some(error))?;
+        insert_job_event(
+            conn,
+            job_id,
+            event_name,
+            json!({
+                "error": error,
+                "attempt": job.attempt,
+                "max_attempts": job.max_attempts,
+                "next_state": next_state,
+                "backoff": backoff,
+                "total_ms": total_ms.map(ms_to_u64),
+            }),
+        )
+    })
+}
+
+pub fn get_sqlite_job(conn: &Connection, job_id: &str) -> Result<Option<SqliteJob>, String> {
+    conn.query_row(
+        "SELECT * FROM jobs WHERE id = ?1",
+        params![job_id],
+        sqlite_job_from_row,
+    )
+    .optional()
+    .map_err(|e| format!("get sqlite job {job_id}: {e}"))
+}
+
+pub fn list_sqlite_job_events(
+    conn: &Connection,
+    job_id: &str,
+) -> Result<Vec<SqliteJobEvent>, String> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT id, job_id, event, data, created_at
+            FROM job_events
+            WHERE job_id = ?1
+            ORDER BY id
+            "#,
+        )
+        .map_err(|e| format!("prepare sqlite job events query: {e}"))?;
+    let rows = stmt
+        .query_map(params![job_id], sqlite_job_event_from_row)
+        .map_err(|e| format!("query sqlite job events: {e}"))?;
+
+    let mut events = Vec::new();
+    for row in rows {
+        events.push(row.map_err(|e| format!("read sqlite job event row: {e}"))?);
+    }
+    Ok(events)
+}
+
+fn with_immediate_tx<T>(
+    conn: &Connection,
+    f: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|e| format!("begin sqlite immediate tx: {e}"))?;
+    match f() {
+        Ok(value) => {
+            conn.execute_batch("COMMIT")
+                .map_err(|e| format!("commit sqlite immediate tx: {e}"))?;
+            Ok(value)
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(err)
+        }
+    }
+}
+
+fn find_active_job_by_dedupe(
+    conn: &Connection,
+    job_type: &str,
+    dedupe_key: &str,
+) -> rusqlite::Result<Option<SqliteJob>> {
+    conn.query_row(
+        r#"
+        SELECT *
+        FROM jobs
+        WHERE job_type = ?1
+          AND dedupe_key = ?2
+          AND state IN ('queued', 'running')
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+        params![job_type, dedupe_key],
+        sqlite_job_from_row,
+    )
+    .optional()
+}
+
+fn insert_job_event(
+    conn: &Connection,
+    job_id: &str,
+    event: &str,
+    data: Value,
+) -> Result<(), String> {
+    let data_text =
+        serde_json::to_string(&data).map_err(|e| format!("serialize job event data: {e}"))?;
+    conn.execute(
+        "INSERT INTO job_events (job_id, event, data) VALUES (?1, ?2, ?3)",
+        params![job_id, event, data_text],
+    )
+    .map_err(|e| format!("insert sqlite job event {event}: {e}"))?;
+    Ok(())
+}
+
+fn set_latest_attempt_state(
+    conn: &Connection,
+    job_id: &str,
+    state: &str,
+    error: Option<&str>,
+) -> Result<(), String> {
+    conn.execute(
+        r#"
+        UPDATE job_attempts
+        SET finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            state = ?2,
+            error = ?3
+        WHERE id = (
+            SELECT id
+            FROM job_attempts
+            WHERE job_id = ?1
+            ORDER BY started_at DESC, id DESC
+            LIMIT 1
+        )
+        "#,
+        params![job_id, state, error],
+    )
+    .map_err(|e| format!("update sqlite latest job attempt: {e}"))?;
+    Ok(())
+}
+
+fn claimed_job_from_row(row: &Row<'_>) -> rusqlite::Result<ClaimedJob> {
+    let payload_text: String = row.get("payload")?;
+    let payload = parse_json_text(payload_text);
+    Ok(ClaimedJob {
+        id: row.get("id")?,
+        attempt: row.get("attempt")?,
+        max_attempts: row.get("max_attempts")?,
+        payload,
+    })
+}
+
+fn sqlite_job_from_row(row: &Row<'_>) -> rusqlite::Result<SqliteJob> {
+    let payload_text: String = row.get("payload")?;
+    Ok(SqliteJob {
+        id: row.get("id")?,
+        job_type: row.get("job_type")?,
+        payload: parse_json_text(payload_text),
+        dedupe_key: row.get("dedupe_key")?,
+        state: row.get("state")?,
+        priority: row.get("priority")?,
+        attempt: row.get("attempt")?,
+        max_attempts: row.get("max_attempts")?,
+        progress_done: row.get("progress_done")?,
+        progress_total: row.get("progress_total")?,
+        error: row.get("error")?,
+        worker_id: row.get("worker_id")?,
+        scheduled_at: row.get("scheduled_at")?,
+        started_at: row.get("started_at")?,
+        finished_at: row.get("finished_at")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
+}
+
+fn sqlite_job_event_from_row(row: &Row<'_>) -> rusqlite::Result<SqliteJobEvent> {
+    let data_text: String = row.get("data")?;
+    Ok(SqliteJobEvent {
+        id: row.get("id")?,
+        job_id: row.get("job_id")?,
+        event: row.get("event")?,
+        data: parse_json_text(data_text),
+        created_at: row.get("created_at")?,
+    })
+}
+
+fn parse_json_text(text: String) -> Value {
+    serde_json::from_str(&text).unwrap_or_else(|_| json!({}))
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn ms_to_u64(value: u128) -> u64 {
+    value.min(u64::MAX as u128) as u64
+}
+
 #[cfg(test)]
 mod tests {
-    use super::init_sqlite_db;
+    use super::{
+        claim_next_sqlite_job, enqueue_sqlite_job, get_sqlite_job, init_sqlite_db,
+        list_sqlite_job_events, mark_sqlite_job_failed, mark_sqlite_job_succeeded,
+    };
     use crate::sqlite_schema::SQLITE_SCHEMA_VERSION;
     use rusqlite::Connection;
-    use std::collections::HashSet;
+    use serde_json::{json, Value};
+    use std::collections::{HashSet, VecDeque};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
 
     fn temp_db_path() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -83,6 +559,27 @@ mod tests {
             .query_map([], |row| row.get::<_, String>(0))
             .expect("query names");
         rows.map(|row| row.expect("name row")).collect()
+    }
+
+    fn event_names(conn: &Connection, job_id: &str) -> Vec<String> {
+        list_sqlite_job_events(conn, job_id)
+            .expect("list events")
+            .into_iter()
+            .map(|event| event.event)
+            .collect()
+    }
+
+    fn event_count(conn: &Connection, job_id: &str, event: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM job_events WHERE job_id = ?1 AND event = ?2",
+            [job_id, event],
+            |row| row.get(0),
+        )
+        .expect("event count")
+    }
+
+    fn payload(name: &str) -> Value {
+        json!({"name": name})
     }
 
     #[test]
@@ -328,5 +825,364 @@ mod tests {
                 "{table}.{name} looks like media content storage"
             );
         }
+    }
+
+    #[test]
+    fn enqueue_creates_job_and_enqueued_event() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+
+        let result =
+            enqueue_sqlite_job(&conn, "thumb", payload("first"), 20, 0, None).expect("enqueue");
+
+        assert!(!result.deduped);
+        assert_eq!(result.job.job_type, "thumb");
+        assert_eq!(result.job.state, "queued");
+        assert_eq!(result.job.priority, 20);
+        assert_eq!(result.job.max_attempts, 1);
+        assert_eq!(result.job.payload["name"], "first");
+
+        let events = list_sqlite_job_events(&conn, &result.job.id).expect("events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "enqueued");
+        assert_eq!(events[0].data["job_type"], "thumb");
+    }
+
+    #[test]
+    fn active_dedupe_returns_existing_job_without_duplicate_enqueue_event() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+
+        let first = enqueue_sqlite_job(
+            &conn,
+            "thumb",
+            payload("dedupe"),
+            10,
+            3,
+            Some("thumb:img:1"),
+        )
+        .expect("first enqueue");
+        let second = enqueue_sqlite_job(
+            &conn,
+            "thumb",
+            payload("dedupe-new"),
+            10,
+            3,
+            Some("thumb:img:1"),
+        )
+        .expect("second enqueue");
+
+        assert!(second.deduped);
+        assert_eq!(second.job.id, first.job.id);
+        assert_eq!(event_count(&conn, &first.job.id, "enqueued"), 1);
+
+        let claimed = claim_next_sqlite_job(&conn, Some("thumb"), "worker-a")
+            .expect("claim")
+            .expect("claimed");
+        assert_eq!(claimed.id, first.job.id);
+
+        let third = enqueue_sqlite_job(
+            &conn,
+            "thumb",
+            payload("dedupe-running"),
+            10,
+            3,
+            Some("thumb:img:1"),
+        )
+        .expect("third enqueue");
+        assert!(third.deduped);
+        assert_eq!(third.job.id, first.job.id);
+        assert_eq!(event_count(&conn, &first.job.id, "enqueued"), 1);
+    }
+
+    #[test]
+    fn dedupe_key_can_enqueue_again_after_success() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+
+        let first =
+            enqueue_sqlite_job(&conn, "thumb", payload("first"), 10, 3, Some("thumb:img:2"))
+                .expect("first enqueue");
+        let claimed = claim_next_sqlite_job(&conn, Some("thumb"), "worker-a")
+            .expect("claim")
+            .expect("claimed");
+        mark_sqlite_job_succeeded(&conn, &claimed.id, Some(1), None).expect("success");
+
+        let second = enqueue_sqlite_job(
+            &conn,
+            "thumb",
+            payload("second"),
+            10,
+            3,
+            Some("thumb:img:2"),
+        )
+        .expect("second enqueue");
+
+        assert!(!second.deduped);
+        assert_ne!(second.job.id, first.job.id);
+        assert_eq!(event_count(&conn, &first.job.id, "enqueued"), 1);
+        assert_eq!(event_count(&conn, &second.job.id, "enqueued"), 1);
+    }
+
+    #[test]
+    fn claim_respects_type_schedule_priority_and_fifo_order() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+
+        let future = enqueue_sqlite_job(&conn, "thumb", payload("future"), 100, 3, None)
+            .expect("future enqueue");
+        conn.execute(
+            "UPDATE jobs SET scheduled_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+1 hour') WHERE id = ?1",
+            [&future.job.id],
+        )
+        .expect("schedule future");
+
+        let ignored_type = enqueue_sqlite_job(&conn, "metadata", payload("metadata"), 200, 3, None)
+            .expect("metadata enqueue");
+        let older = enqueue_sqlite_job(&conn, "thumb", payload("older"), 50, 3, None)
+            .expect("older enqueue");
+        let newer = enqueue_sqlite_job(&conn, "thumb", payload("newer"), 50, 3, None)
+            .expect("newer enqueue");
+        let high =
+            enqueue_sqlite_job(&conn, "thumb", payload("high"), 90, 3, None).expect("high enqueue");
+
+        conn.execute(
+            "UPDATE jobs SET created_at = '2026-01-01T00:00:00.000Z', scheduled_at = '2026-01-01T00:00:00.000Z' WHERE id = ?1",
+            [&older.job.id],
+        )
+        .expect("older timestamps");
+        conn.execute(
+            "UPDATE jobs SET created_at = '2026-01-01T00:00:01.000Z', scheduled_at = '2026-01-01T00:00:00.000Z' WHERE id = ?1",
+            [&newer.job.id],
+        )
+        .expect("newer timestamps");
+        conn.execute(
+            "UPDATE jobs SET created_at = '2026-01-01T00:00:02.000Z', scheduled_at = '2026-01-01T00:00:00.000Z' WHERE id = ?1",
+            [&high.job.id],
+        )
+        .expect("high timestamps");
+
+        let first = claim_next_sqlite_job(&conn, Some("thumb"), "worker-a")
+            .expect("claim first")
+            .expect("first");
+        let second = claim_next_sqlite_job(&conn, Some("thumb"), "worker-b")
+            .expect("claim second")
+            .expect("second");
+        let third = claim_next_sqlite_job(&conn, Some("thumb"), "worker-c")
+            .expect("claim third")
+            .expect("third");
+
+        assert_eq!(first.id, high.job.id);
+        assert_eq!(second.id, older.job.id);
+        assert_eq!(third.id, newer.job.id);
+        assert!(claim_next_sqlite_job(&conn, Some("thumb"), "worker-d")
+            .expect("claim none")
+            .is_none());
+
+        let metadata = get_sqlite_job(&conn, &ignored_type.job.id)
+            .expect("metadata")
+            .expect("metadata job");
+        let future = get_sqlite_job(&conn, &future.job.id)
+            .expect("future")
+            .expect("future job");
+        assert_eq!(metadata.state, "queued");
+        assert_eq!(future.state, "queued");
+    }
+
+    #[test]
+    fn claim_creates_attempt_and_started_event() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let enqueued =
+            enqueue_sqlite_job(&conn, "thumb", payload("claim"), 10, 3, None).expect("enqueue");
+
+        let claimed = claim_next_sqlite_job(&conn, Some("thumb"), "worker-a")
+            .expect("claim")
+            .expect("claimed");
+
+        assert_eq!(claimed.id, enqueued.job.id);
+        assert_eq!(claimed.attempt, 1);
+        assert_eq!(claimed.payload["name"], "claim");
+
+        let attempt_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM job_attempts WHERE job_id = ?1 AND attempt = 1 AND worker_id = 'worker-a' AND state = 'running'",
+                [&claimed.id],
+                |row| row.get(0),
+            )
+            .expect("attempt count");
+        assert_eq!(attempt_count, 1);
+
+        let events = list_sqlite_job_events(&conn, &claimed.id).expect("events");
+        assert_eq!(events[0].event, "enqueued");
+        assert_eq!(events[1].event, "started");
+        assert_eq!(events[1].data["worker_id"], "worker-a");
+    }
+
+    #[test]
+    fn concurrent_claims_never_return_duplicate_jobs() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let mut expected = HashSet::new();
+        for index in 0..12 {
+            let job = enqueue_sqlite_job(
+                &conn,
+                "thumb",
+                payload(&format!("job-{index}")),
+                10,
+                3,
+                None,
+            )
+            .expect("enqueue");
+            expected.insert(job.job.id);
+        }
+        drop(conn);
+
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let connections = (0..6)
+            .map(|_| init_sqlite_db(&db_path).expect("thread connection init"))
+            .collect::<Vec<_>>();
+        let mut handles = Vec::new();
+        for (worker_index, conn) in connections.into_iter().enumerate() {
+            let results = Arc::clone(&results);
+            handles.push(thread::spawn(move || loop {
+                let claimed =
+                    claim_next_sqlite_job(&conn, Some("thumb"), &format!("worker-{worker_index}"))
+                        .expect("thread claim");
+                let Some(job) = claimed else {
+                    break;
+                };
+                results.lock().expect("lock results").push(job.id);
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("join worker");
+        }
+
+        let claimed = results.lock().expect("lock final");
+        let unique = claimed.iter().cloned().collect::<HashSet<_>>();
+        assert_eq!(claimed.len(), 12);
+        assert_eq!(unique.len(), 12);
+        assert_eq!(unique, expected);
+    }
+
+    #[test]
+    fn success_updates_job_latest_attempt_and_event() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let enqueued =
+            enqueue_sqlite_job(&conn, "thumb", payload("success"), 10, 3, None).expect("enqueue");
+        let claimed = claim_next_sqlite_job(&conn, Some("thumb"), "worker-a")
+            .expect("claim")
+            .expect("claimed");
+
+        mark_sqlite_job_succeeded(
+            &conn,
+            &claimed.id,
+            Some(7),
+            Some(json!({"custom": true, "total": 7})),
+        )
+        .expect("success");
+
+        let job = get_sqlite_job(&conn, &enqueued.job.id)
+            .expect("job")
+            .expect("job row");
+        assert_eq!(job.state, "succeeded");
+        assert_eq!(job.progress_done, 7);
+        assert_eq!(job.progress_total, 7);
+        assert!(job.finished_at.is_some());
+        assert!(job.error.is_none());
+
+        let attempt_state: String = conn
+            .query_row(
+                "SELECT state FROM job_attempts WHERE job_id = ?1 ORDER BY id DESC LIMIT 1",
+                [&job.id],
+                |row| row.get(0),
+            )
+            .expect("attempt state");
+        assert_eq!(attempt_state, "succeeded");
+
+        let events = list_sqlite_job_events(&conn, &job.id).expect("events");
+        assert_eq!(events.last().expect("last event").event, "succeeded");
+        assert_eq!(events.last().expect("last event").data["custom"], true);
+    }
+
+    #[test]
+    fn failure_with_retries_schedules_retry_event() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let enqueued =
+            enqueue_sqlite_job(&conn, "thumb", payload("retry"), 10, 3, None).expect("enqueue");
+        let claimed = claim_next_sqlite_job(&conn, Some("thumb"), "worker-a")
+            .expect("claim")
+            .expect("claimed");
+
+        mark_sqlite_job_failed(&conn, &claimed.id, "render failed", 120, Some(123))
+            .expect("fail retry");
+
+        let job = get_sqlite_job(&conn, &enqueued.job.id)
+            .expect("job")
+            .expect("job row");
+        assert_eq!(job.state, "queued");
+        assert_eq!(job.error.as_deref(), Some("render failed"));
+        assert!(job.worker_id.is_none());
+        assert!(job.scheduled_at > enqueued.job.scheduled_at);
+
+        let attempt_state: String = conn
+            .query_row(
+                "SELECT state FROM job_attempts WHERE job_id = ?1 ORDER BY id DESC LIMIT 1",
+                [&job.id],
+                |row| row.get(0),
+            )
+            .expect("attempt state");
+        assert_eq!(attempt_state, "queued");
+
+        let events = list_sqlite_job_events(&conn, &job.id).expect("events");
+        let event = events.last().expect("last event");
+        assert_eq!(event.event, "retry_scheduled");
+        assert_eq!(event.data["next_state"], "queued");
+        assert_eq!(event.data["backoff"], 2);
+        assert_eq!(event.data["total_ms"], 123);
+    }
+
+    #[test]
+    fn final_failure_writes_failed_state_finished_at_attempt_and_event() {
+        let (_dir, db_path) = temp_db_path();
+        let conn = init_sqlite_db(&db_path).expect("init");
+        let enqueued =
+            enqueue_sqlite_job(&conn, "thumb", payload("final"), 10, 1, None).expect("enqueue");
+        let claimed = claim_next_sqlite_job(&conn, Some("thumb"), "worker-a")
+            .expect("claim")
+            .expect("claimed");
+
+        mark_sqlite_job_failed(&conn, &claimed.id, "no retries", 120, None).expect("final fail");
+
+        let job = get_sqlite_job(&conn, &enqueued.job.id)
+            .expect("job")
+            .expect("job row");
+        assert_eq!(job.state, "failed");
+        assert_eq!(job.error.as_deref(), Some("no retries"));
+        assert!(job.finished_at.is_some());
+
+        let attempt_state: String = conn
+            .query_row(
+                "SELECT state FROM job_attempts WHERE job_id = ?1 ORDER BY id DESC LIMIT 1",
+                [&job.id],
+                |row| row.get(0),
+            )
+            .expect("attempt state");
+        assert_eq!(attempt_state, "failed");
+
+        let mut names = VecDeque::from(event_names(&conn, &job.id));
+        assert_eq!(names.pop_front().as_deref(), Some("enqueued"));
+        assert_eq!(names.pop_front().as_deref(), Some("started"));
+        assert_eq!(names.pop_front().as_deref(), Some("failed"));
+
+        let events = list_sqlite_job_events(&conn, &job.id).expect("events");
+        let event = events.last().expect("last event");
+        assert_eq!(event.event, "failed");
+        assert_eq!(event.data["next_state"], "failed");
+        assert_eq!(event.data["backoff"], 0);
+        assert_eq!(event.data["total_ms"], Value::Null);
     }
 }

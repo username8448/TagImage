@@ -1816,6 +1816,7 @@ dependencies = [
  "tagimage-core",
  "tempfile",
  "tokio-postgres",
+ "uuid",
 ]
 
 [[package]]
