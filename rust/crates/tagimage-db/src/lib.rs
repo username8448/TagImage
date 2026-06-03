@@ -1,4 +1,5 @@
 pub mod sqlite;
+mod sqlite_runtime;
 mod sqlite_schema;
 
 use serde_json::{json, Value};
